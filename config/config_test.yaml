@@ -48,4 +48,4 @@ filters:
 alerts:
   telegram_enabled: true
   telegram_bot_token: "8769322166:AAF_snH6dzNOJE9oL8XnPKooe2AbqGjTO2Y"
-  telegram_chat_id: ""   # GET THIS: open Telegram > search @userinfobot > tap Start > copy the number
+  telegram_chat_id: "7868227129"
