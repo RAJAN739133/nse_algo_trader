@@ -13,6 +13,7 @@ env/
 # Config with secrets
 config/config.yaml
 config/config_prod.yaml
+config/config_test.yaml
 .env
 .env.prod
 

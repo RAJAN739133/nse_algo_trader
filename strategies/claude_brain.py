@@ -30,9 +30,19 @@ SAFETY_LIMITS = {
 class ClaudeBrain:
     """AI-powered strategy adaptation."""
 
-    def __init__(self, api_key=None):
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        self.enabled = bool(self.api_key)
+    def __init__(self, api_key=None, config=None):
+        # Read API key from: 1) parameter, 2) config file, 3) environment variable
+        if api_key:
+            self.api_key = api_key
+        elif config and config.get("claude", {}).get("api_key"):
+            self.api_key = config["claude"]["api_key"]
+        else:
+            self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
+
+        self.enabled = bool(self.api_key) and self.api_key not in ("", "YOUR_ANTHROPIC_API_KEY")
+
+        if config and not config.get("claude", {}).get("enabled", True):
+            self.enabled = False
 
     def get_morning_analysis(self, vix, fii_net, recent_trades, stock_scores):
         """Call Claude for morning strategy adjustment."""
