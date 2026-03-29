@@ -1,0 +1,3 @@
+symbol,strategy,entry,exit,qty,gross,costs,net_pnl,reason
+SBIN,ORB,630.35,633.23,74,213.12,50.1,163.02,TRAILING
+ITC,ORB,1109.57,1170.32,24,1458.0,29.31,1428.69,TARGET

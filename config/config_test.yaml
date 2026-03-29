@@ -46,6 +46,6 @@ filters:
   vix_skip_threshold: 25
 
 alerts:
-  telegram_enabled: false
-  telegram_bot_token: ""
-  telegram_chat_id: ""
+  telegram_enabled: true
+  telegram_bot_token: "8769322166:AAF_snH6dzNOJE9oL8XnPKooe2AbqGjTO2Y"
+  telegram_chat_id: ""   # GET THIS: open Telegram > search @userinfobot > tap Start > copy the number

@@ -5,7 +5,9 @@
 
 # Which source to use for TRAINING the ML model?
 # Options: "kaggle", "yfinance", "csv_folder", "synthetic"
-training_source: "synthetic"     # Start here (no internet needed)
+# LOCAL:      use "synthetic" (no internet needed for testing)
+# DEPLOYED:   use "yfinance" (auto-downloads real data)
+training_source: "synthetic"     # Change to "yfinance" after deployment
 
 # Which source to use for LIVE/PAPER trading data?
 # Options: "yfinance", "kite", "synthetic"
