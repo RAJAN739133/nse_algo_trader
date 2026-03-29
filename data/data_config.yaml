@@ -1,0 +1,43 @@
+# ============================================================
+# DATA SOURCE CONFIGURATION
+# Change this to switch between data sources easily.
+# ============================================================
+
+# Which source to use for TRAINING the ML model?
+# Options: "kaggle", "yfinance", "csv_folder", "synthetic"
+training_source: "synthetic"     # Start here (no internet needed)
+
+# Which source to use for LIVE/PAPER trading data?
+# Options: "yfinance", "kite", "synthetic"
+live_source: "yfinance"          # Free, no API key needed
+
+# Which source for BACKTESTING on past dates?
+# Options: "yfinance", "kaggle", "csv_folder", "synthetic"
+backtest_source: "yfinance"
+
+# ── Kaggle settings ──
+kaggle:
+  folder: "data/kaggle"          # Put downloaded CSVs here
+  # Download from: kaggle.com/datasets/ashishjangra27/nifty-50-25-yrs-data
+
+# ── yfinance settings (FREE, no API key!) ──
+yfinance:
+  history_years: 5               # How many years to download
+  interval: "1d"                 # "1d", "1h", "5m" (intraday limited to 60 days)
+  cache_folder: "data/cache"     # Cache downloaded data locally
+
+# ── CSV folder settings ──
+csv_folder:
+  path: "data/custom"            # Put any CSV files here
+  date_column: "date"            # Column name for dates
+  # CSV must have: date, open, high, low, close, volume
+
+# ── Kite Connect settings (paid Rs 2000/month) ──
+kite:
+  intraday_days: 60              # Kite gives max 60 days of intraday
+  interval: "5minute"            # "minute", "5minute", "15minute", "day"
+
+# ── Synthetic settings (for testing, no internet needed) ──
+synthetic:
+  years: 10
+  num_stocks: 10                 # How many Nifty stocks to simulate

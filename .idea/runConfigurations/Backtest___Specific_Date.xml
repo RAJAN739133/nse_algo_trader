@@ -1,0 +1,12 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Backtest - Specific Date" type="PythonConfigurationType" factoryName="Python">
+    <module name="nse_algo_trader" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/run_backtest.py" />
+    <option name="PARAMETERS" value="--date 2024-06-04" />
+    <method v="2" />
+  </configuration>
+</component>

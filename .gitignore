@@ -19,6 +19,8 @@ config/config_prod.yaml
 # Data files (too large for git)
 data/market_data.db
 data/kaggle/
+data/cache/
+data/custom/
 data/*.csv
 models/*.pkl
 models/*.json
