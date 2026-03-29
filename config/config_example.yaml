@@ -1,0 +1,54 @@
+# ============================================================
+# NSE Algo Trader Configuration
+# Copy this file to config.yaml and fill in your details
+# ============================================================
+
+zerodha:
+  api_key: "YOUR_KITE_API_KEY"        # From https://developers.kite.trade
+  api_secret: "YOUR_KITE_API_SECRET"
+  # Access token is generated daily via login — handled by the code
+
+capital:
+  total: 100000          # Total capital in INR
+  risk_per_trade: 0.01   # 1% max risk per trade
+  max_trades_per_day: 2
+  daily_loss_limit: 0.03 # 3% daily loss limit — stop trading
+  weekly_loss_limit: 0.07
+
+trading:
+  mode: "paper"          # "paper" or "live"
+  start_time: "09:15"
+  end_time: "15:15"
+  square_off_time: "15:10"
+  # Only trade these hours (skip 11:00-14:00 dead zone)
+  active_windows:
+    - ["09:15", "10:30"]
+    - ["14:00", "15:10"]
+
+strategies:
+  orb:
+    enabled: true
+    orb_period_minutes: 15     # First 15-min candle
+    volume_multiplier: 1.5     # Entry needs 1.5x avg volume
+    atr_stop_multiplier: 1.5   # Stop at 1.5x ATR
+    trail_after_rr: 1.5        # Start trailing after 1.5x R
+    partial_exit_rr: 1.0       # Book 50% at 1:1
+
+  vwap:
+    enabled: true
+    entry_band: 1.0            # Enter at VWAP ± 1 sigma
+    stop_band: 2.0             # Stop at VWAP ± 2 sigma
+    target_band: 0.0           # Target = VWAP itself
+    min_volume_percentile: 60  # Only trade when volume > 60th percentile
+
+filters:
+  min_avg_volume: 1000000      # 10L shares minimum avg daily volume
+  max_gap_percent: 3.0         # Skip stocks gapping > 3%
+  max_vix: 20                  # Reduce size if VIX > 20, skip if > 25
+  vix_reduce_threshold: 20
+  vix_skip_threshold: 25
+
+alerts:
+  telegram_enabled: false
+  telegram_bot_token: "YOUR_BOT_TOKEN"
+  telegram_chat_id: "YOUR_CHAT_ID"
