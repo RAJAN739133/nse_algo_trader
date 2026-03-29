@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+
+# Config with secrets
+config/config.yaml
+config/config_prod.yaml
+.env
+.env.prod
+
+# Data files (too large for git)
+data/market_data.db
+data/kaggle/
+data/*.csv
+models/*.pkl
+models/*.json
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kill switch
+KILL
+
+# Session files
+*.session

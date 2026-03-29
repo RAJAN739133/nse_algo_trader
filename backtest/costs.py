@@ -85,6 +85,12 @@ class ZerodhaCostModel:
             total_percent=round(total_pct, 4),
         )
 
+    def total_cost(self, price: float, qty: int, trade_type: str = "intraday") -> float:
+        """Quick cost estimate for a single side (buy or sell)."""
+        value = price * qty
+        result = self.calculate(value, value)
+        return result.total / 2  # half for one side
+
     def estimate_daily_cost(
         self,
         avg_trade_value: float,
