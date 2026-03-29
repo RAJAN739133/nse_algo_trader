@@ -1,9 +1,11 @@
 # ============================================================
 # DATA SOURCE CONFIGURATION
-# Change this to switch between data sources easily.
 # ============================================================
 
-# Which source to use for TRAINING the ML model?
+# Which stock universe? Options: "nifty50", "nifty100", "nifty250"
+universe: "nifty50"
+
+# Which source for TRAINING?
 # Options: "kaggle", "yfinance", "csv_folder", "synthetic"
 # LOCAL:      use "synthetic" (no internet needed for testing)
 # DEPLOYED:   use "yfinance" (auto-downloads real data)
@@ -43,3 +45,11 @@ kite:
 synthetic:
   years: 10
   num_stocks: 10                 # How many Nifty stocks to simulate
+
+# ── Model Training Schedule ──
+model:
+  retrain_frequency: "weekly"    # "daily", "weekly", "monthly", "manual"
+  # daily = retrain every morning (slow, uses more API/compute)
+  # weekly = retrain Saturday (recommended)
+  # monthly = retrain 1st of month
+  # manual = only when you run 'python -m data.train_pipeline train'

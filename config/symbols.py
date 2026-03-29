@@ -1,74 +1,80 @@
 """
-Curated NSE stock universe for intraday algo trading.
-Selected for: high liquidity, tight spreads, F&O availability, and
-suitability for ORB + VWAP strategies with ₹1L capital.
+Configurable stock universe — NIFTY 50 / 100 / 250.
+Change ACTIVE_UNIVERSE below or in data/data_config.yaml to switch.
 """
 
-# Tier 1: Best for intraday — highest volume, tightest spreads
-# These should be your primary focus with ₹1L capital
-TIER1_STOCKS = [
-    "RELIANCE",
-    "HDFCBANK",
-    "ICICIBANK",
-    "TCS",
-    "INFY",
-    "SBIN",
-    "BHARTIARTL",
-    "ITC",
-    "KOTAKBANK",
-    "LT",
+NIFTY_50 = [
+    "RELIANCE","HDFCBANK","ICICIBANK","TCS","INFY","BHARTIARTL",
+    "SBIN","ITC","LT","KOTAKBANK","AXISBANK","BAJFINANCE",
+    "TATAMOTORS","MARUTI","SUNPHARMA","HCLTECH","WIPRO",
+    "TATASTEEL","NTPC","POWERGRID","COALINDIA","ONGC",
+    "TITAN","ASIANPAINT","ULTRACEMCO","BAJAJFINSV","NESTLEIND",
+    "TECHM","HINDALCO","HINDUNILVR","JSWSTEEL","ADANIPORTS",
+    "DRREDDY","CIPLA","EICHERMOT","BRITANNIA","DIVISLAB",
+    "HEROMOTOCO","BPCL","GRASIM","APOLLOHOSP","TRENT",
+    "TATACONSUM","SBILIFE","HDFCLIFE","M&M","BAJAJ-AUTO",
+    "SHREECEM","INDUSINDBK","IOC",
 ]
 
-# Tier 2: Good liquidity, slightly wider spreads
-TIER2_STOCKS = [
-    "AXISBANK",
-    "TATAMOTORS",
-    "MARUTI",
-    "SUNPHARMA",
-    "HCLTECH",
-    "WIPRO",
-    "BAJFINANCE",
-    "TATASTEEL",
-    "NTPC",
-    "POWERGRID",
+NIFTY_100_EXTRA = [
+    "ADANIENT","ADANIGREEN","ADANIPOWER","AMBUJACEM","BANKBARODA",
+    "BEL","BERGEPAINT","BOSCHLTD","CANBK","CHOLAFIN",
+    "COLPAL","CONCOR","DABUR","DLF","GAIL",
+    "GODREJCP","HAVELLS","HAL","ICICIPRULI","ICICIGI",
+    "IDFCFIRSTB","INDHOTEL","IRCTC","IRFC","JINDALSTEL",
+    "JSWENERGY","LTF","LTIM","LUPIN","MARICO",
+    "MAXHEALTH","MOTHERSON","MUTHOOTFIN","NHPC","NYKAA",
+    "OBEROIRLTY","PFC","PIDILITIND","PNB","POLYCAB",
+    "RECLTD","SBICARD","SIEMENS","SRF","TORNTPHARM",
+    "TVSMOTOR","UNITDSPR","VEDL","ZOMATO","ZYDUSLIFE",
 ]
 
-# Index instruments (for hedging and benchmarking)
-INDEX_INSTRUMENTS = [
-    "NIFTY 50",
-    "NIFTY BANK",
+NIFTY_250_EXTRA = [
+    "AARTIIND","ABB","ABCAPITAL","ABFRL","ACC",
+    "AJANTPHARM","ALKEM","APLAPOLLO","ASHOKLEY","ASTRAL",
+    "ATUL","AUBANK","AUROPHARMA","BALKRISIND","BALRAMCHIN",
+    "BANDHANBNK","BATAINDIA","BHEL","BIOCON","CANFINHOME",
+    "CHAMBLFERT","CLEAN","COFORGE","CROMPTON","CUB",
+    "CUMMINSIND","DEEPAKNTR","DELTACORP","DIXON","ESCORTS",
+    "EXIDEIND","FEDERALBNK","FORTIS","GMRINFRA","GNFC",
+    "GRANULES","GSPL","GUJGASLTD","HDFCAMC","HINDPETRO",
+    "HONAUT","IBREALEST","IGL","INDUSTOWER","INTELLECT",
+    "IOB","IPCA","JUBLFOOD","KALYANKJIL","KEI",
+    "KPITTECH","LALPATHLAB","LAURUSLABS","LICHSGFIN","LTTS",
+    "M&MFIN","MANAPPURAM","MFSL","MGL","MPHASIS",
+    "MRF","NAM-INDIA","NATIONALUM","NAUKRI","NAVINFLUOR",
+    "NMDC","OFSS","PAGEIND","PERSISTENT","PETRONET",
+    "PIIND","PRESTIGE","PVR","RAMCOCEM","RBLBANK",
+    "SAIL","SAPPHIRE","SOLARINDS","SONACOMS","STARHEALTH",
+    "SUNDARMFIN","SUNDRMFAST","SUNTV","SUPREMEIND","SYNGENE",
+    "TATACHEM","TATACOMM","TATAELXSI","TATAPOWER","THERMAX",
+    "TIINDIA","TIMKEN","TRENT","TRIDENT","UBL",
+    "UJJIVANSFB","UNIONBANK","UPL","VOLTAS","WHIRLPOOL",
 ]
 
-# Full universe = Tier 1 + Tier 2
-ALL_STOCKS = TIER1_STOCKS + TIER2_STOCKS
+# ═══ CONFIGURE YOUR UNIVERSE HERE ═══
+# Options: "nifty50", "nifty100", "nifty250"
+ACTIVE_UNIVERSE = "nifty50"
 
-# Default: start with Tier 1 only (simpler, more liquid)
-DEFAULT_UNIVERSE = TIER1_STOCKS
+def get_universe(name=None):
+    """Get stock list by universe name."""
+    name = (name or ACTIVE_UNIVERSE).lower().replace(" ", "").replace("_", "")
+    if name in ("nifty250", "250"):
+        return NIFTY_50 + NIFTY_100_EXTRA + NIFTY_250_EXTRA
+    elif name in ("nifty100", "100"):
+        return NIFTY_50 + NIFTY_100_EXTRA
+    else:  # default nifty50
+        return NIFTY_50
 
-# NSE exchange string for Kite Connect
-EXCHANGE = "NSE"
+DEFAULT_UNIVERSE = get_universe()
+ALL_STOCKS = NIFTY_50 + NIFTY_100_EXTRA + NIFTY_250_EXTRA
 
-# Kite instrument tokens are fetched dynamically at runtime
-# This mapping is just for human reference
 STOCK_SECTORS = {
-    "RELIANCE": "Energy",
-    "HDFCBANK": "Banking",
-    "ICICIBANK": "Banking",
-    "TCS": "IT",
-    "INFY": "IT",
-    "SBIN": "Banking",
-    "BHARTIARTL": "Telecom",
-    "ITC": "FMCG",
-    "KOTAKBANK": "Banking",
-    "LT": "Infrastructure",
-    "AXISBANK": "Banking",
-    "TATAMOTORS": "Auto",
-    "MARUTI": "Auto",
-    "SUNPHARMA": "Pharma",
-    "HCLTECH": "IT",
-    "WIPRO": "IT",
-    "BAJFINANCE": "NBFC",
-    "TATASTEEL": "Metals",
-    "NTPC": "Power",
-    "POWERGRID": "Power",
+    "RELIANCE":"Energy","HDFCBANK":"Banking","ICICIBANK":"Banking","TCS":"IT",
+    "INFY":"IT","SBIN":"Banking","BHARTIARTL":"Telecom","ITC":"FMCG",
+    "KOTAKBANK":"Banking","LT":"Infra","AXISBANK":"Banking","TATAMOTORS":"Auto",
+    "MARUTI":"Auto","SUNPHARMA":"Pharma","HCLTECH":"IT","WIPRO":"IT",
+    "BAJFINANCE":"NBFC","TATASTEEL":"Metals","NTPC":"Power","POWERGRID":"Power",
+    "COALINDIA":"Mining","ONGC":"Energy","TITAN":"Consumer","ASIANPAINT":"Consumer",
+    "HAL":"Defence","BEL":"Defence","ZOMATO":"Tech","ADANIENT":"Infra",
 }
