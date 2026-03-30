@@ -107,16 +107,28 @@ class PaperTrader:
         self.capital = config["capital"]["total"]
         self.positions = {}; self.closed = []; self.pnl = 0; self.count = 0
         self.cost_model = ZerodhaCostModel()
-        self.max_trades = config["capital"]["max_trades_per_day"]
+        # Dynamic max trades based on market conditions
+        # VIX < 14: up to 5 trades (calm market, more opportunities)
+        # VIX 14-20: up to 3 trades (normal)
+        # VIX 20-25: up to 2 trades (volatile, be careful)
+        # VIX > 25: 0 trades (sit out)
+        self.base_max = config["capital"].get("max_trades_per_day", 3)
 
-    def can_trade(self):
-        if self.count >= self.max_trades: return False, "Max trades"
+    def get_max_trades(self, vix=15):
+        if vix < 14: return min(5, self.base_max + 2)
+        elif vix < 20: return min(3, self.base_max)
+        elif vix < 25: return 2
+        return 0
+
+    def can_trade(self, vix=15):
+        mx = self.get_max_trades(vix)
+        if self.count >= mx: return False, f"Max {mx} trades (VIX={vix:.0f})"
         if self.pnl < -self.capital * self.config["capital"]["daily_loss_limit"]: return False, "Loss limit"
         return True, "OK"
 
-    def buy(self, sym, price, qty, sl, target, strat):
+    def buy(self, sym, price, qty, sl, target, strat, vix=15):
         if sym in self.positions: return False
-        ok, reason = self.can_trade()
+        ok, reason = self.can_trade(vix)
         if not ok:
             logger.info(f"    Skip {sym}: {reason}"); return False
         cost = self.cost_model.total_cost(price, qty, "intraday")
@@ -226,7 +238,7 @@ def run_simulate(test_date=None, scenario="normal", stocks=None):
                     risk = sig["entry"] - sig["sl"]
                     if risk > 0:
                         qty = max(1, int(config["capital"]["total"]*config["capital"]["risk_per_trade"]/risk))
-                        trader.buy(sym, sig["entry"], qty, sig["sl"], sig["target"], sig["strat"])
+                        trader.buy(sym, sig["entry"], qty, sig["sl"], sig["target"], sig["strat"], market.vix)
                         orb_done.add(sym)
         # VWAP window 14:00-15:00 (minute 285-345)
         if 285 <= m <= 345 and market.vix < 18:
@@ -237,7 +249,7 @@ def run_simulate(test_date=None, scenario="normal", stocks=None):
                     risk = sig["entry"] - sig["sl"]
                     if risk > 0:
                         qty = max(1, int(config["capital"]["total"]*config["capital"]["risk_per_trade"]/risk))
-                        trader.buy(sym, sig["entry"], qty, sig["sl"], sig["target"], sig["strat"])
+                        trader.buy(sym, sig["entry"], qty, sig["sl"], sig["target"], sig["strat"], market.vix)
         # Square off at 15:10 (minute 355)
         if m >= 355:
             logger.info(f"\n  3:10 PM — Square off"); trader.square_off(); break
