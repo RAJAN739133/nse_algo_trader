@@ -242,9 +242,7 @@ def run(symbols=None):
     if vix > config["filters"]["vix_skip_threshold"]:
         msg = f"VIX {vix} too high — NO TRADING TODAY"
         logger.warning(f"  {msg}")
-    # Send only if sitting out entirely
-    if not candidates:
-        send_telegram(f"📋 {date.today()} | No candidates | Sitting out", config)
+        send_telegram(f"⚠️ *{msg}*\nCapital protected. Sitting out.", config)
         return
 
     # ── Pre-market scan ──
