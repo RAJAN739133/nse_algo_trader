@@ -70,7 +70,9 @@ def send_telegram(msg, config):
         return
     try:
         import urllib.request
-        data = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
+        # Remove markdown if it causes issues — send as plain text
+        clean_msg = msg.replace("*", "").replace("_", "").replace("`", "")
+        data = json.dumps({"chat_id": chat_id, "text": clean_msg}).encode()
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=data, headers={"Content-Type": "application/json"}
