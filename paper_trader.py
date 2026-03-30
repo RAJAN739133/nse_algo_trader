@@ -267,8 +267,7 @@ def run_simulate(test_date=None, scenario="normal", stocks=None):
         for t in trader.closed:
             e = "WIN " if t["net_pnl"] > 0 else "LOSS"
             logger.info(f"    {e} {t['symbol']:>12} | {t['entry']:.2f} -> {t['exit']:.2f} | Rs {t['net_pnl']:+,.2f} | {t['reason']}")
-        pd.DataFrame(trader.closed).to_csv(f"results/paper_{test_date or date.today()}.csv", index=False)
-        logger.info(f"  Saved to results/paper_{test_date or date.today()}.csv")
+        # Results only sent to Telegram, not saved locally
     return trader.closed
 
 

@@ -135,7 +135,7 @@ def wait_until(hour, minute):
 
 def step_download_data(symbols, config):
     logger.info("\n  STEP 1: Downloading latest market data...")
-    send_telegram("📊 *Step 1:* Downloading market data...", config)
+    # Silently download and prepare
     loader = DataLoader()
     df = loader.load_training_data(symbols)
     logger.info(f"  Loaded {len(df):,} rows for {df['symbol'].nunique()} stocks")
@@ -148,7 +148,6 @@ def step_download_data(symbols, config):
 
 def step_train_model(df, config):
     logger.info("\n  STEP 2: Computing features + training ML model...")
-    send_telegram("🧠 *Step 2:* Training ML model...", config)
 
     featured = []
     for sym in df["symbol"].unique():
@@ -162,7 +161,6 @@ def step_train_model(df, config):
     from data.train_pipeline import train_model
     model, feats = train_model(all_featured)
     logger.info(f"  Model trained with {len(feats)} features")
-    send_telegram(f"✅ ML model trained on {all_featured['symbol'].nunique()} stocks", config)
     return model, feats, all_featured
 
 
@@ -189,7 +187,7 @@ def step_score_stocks(featured_df, model, feats, config, vix=15):
 
     msg = "\n".join(msg_lines)
     logger.info(msg)
-    send_telegram(msg, config)
+    # Don't send scores separately — will combine with Claude advice below
     return scores, picks
 
 
@@ -202,18 +200,22 @@ def step_claude_analysis(config, scores, vix=15, fii=0):
     brain = ClaudeBrain(config=config)
     if not brain.enabled:
         logger.info("  Claude Brain: disabled (no API key)")
-        send_telegram("⚠️ Claude Brain: disabled. Add API key to enable.", config)
         return {"risk_level": "normal", "max_trades": 2, "skip_stocks": []}
 
     stock_list = scores.head(5).to_dict("records") if len(scores) > 0 else []
     result = brain.get_morning_analysis(vix, fii, [], stock_list)
-    msg = (f"🤖 *Claude Brain Analysis:*\n"
-           f"Risk level: {result.get('risk_level', 'normal')}\n"
-           f"Max trades: {result.get('max_trades', 2)}\n"
-           f"Skip: {', '.join(result.get('skip_stocks', [])) or 'none'}\n"
-           f"Notes: {result.get('notes', '')}")
-    logger.info(msg)
-    send_telegram(msg, config)
+
+    # Single combined morning message: scores + Claude advice
+    picks_list = scores[scores["score"] >= 60].head(3)
+    top3 = scores.head(3)
+    lines = [f"🔔 {date.today()} Morning"]
+    for _, r in top3.iterrows():
+        star = "🎯" if r["score"] >= 60 else "  "
+        lines.append(f"{star} {r['symbol']}: {r['score']:.0f}/100")
+    lines.append(f"Claude: {result.get('risk_level', 'normal')} | {result.get('notes', '')[:60]}")
+    if picks_list.empty:
+        lines.append("No stocks qualify — sitting out")
+    send_telegram("\n".join(lines), config)
     return result
 
 
@@ -269,12 +271,8 @@ def step_run_trading(picks, config, featured_df, claude_advice):
         trades.append(trade)
 
         emoji = "✅" if net > 0 else "❌"
-        msg = (f"{emoji} *{'BUY' if net > 0 else 'SELL'}* {sym}\n"
-               f"Entry: ₹{entry:.2f} × {qty}\n"
-               f"Exit: ₹{exit_p:.2f} ({reason})\n"
-               f"P&L: ₹{net:+,.2f}")
-        logger.info(msg)
-        send_telegram(msg, config)
+        logger.info(f"  {emoji} {sym} | BUY {entry:.0f} | SELL {exit_p:.0f} | Rs {net:+,.0f} | {reason}")
+        send_telegram(f"{emoji} {sym} | BUY {entry:.0f} | SELL {exit_p:.0f} | Rs {net:+,.0f}", config)
 
     return trades
 
@@ -286,28 +284,18 @@ def step_run_trading(picks, config, featured_df, claude_advice):
 def step_eod_summary(trades, config):
     logger.info("\n  STEP 6: End-of-day summary")
     if not trades:
-        msg = ("📋 *End of Day Summary*\n"
-               f"Date: {date.today()}\n"
-               "Trades: 0\n"
-               "Capital preserved ✅")
+        send_telegram(f"📋 {date.today()} | No trades | Capital safe", config)
     else:
         total = sum(t["net_pnl"] for t in trades)
         wins = sum(1 for t in trades if t["net_pnl"] > 0)
-        msg = (f"📋 *End of Day Summary*\n"
-               f"Date: {date.today()}\n"
-               f"Trades: {len(trades)} | Won: {wins} | Lost: {len(trades)-wins}\n"
-               f"Net P&L: ₹{total:+,.2f}\n"
-               f"Win rate: {wins/len(trades)*100:.0f}%")
+        lines = [f"📋 {date.today()} | {len(trades)} trades | Rs {total:+,.0f}"]
         for t in trades:
             e = "✅" if t["net_pnl"] > 0 else "❌"
-            msg += f"\n{e} {t['symbol']}: ₹{t['net_pnl']:+,.2f} ({t['reason']})"
-
-    logger.info(msg)
-    send_telegram(msg, config)
-
-    # Save results
-    if trades:
-        pd.DataFrame(trades).to_csv(f"results/trades_{date.today()}.csv", index=False)
+            lines.append(f"{e} {t['symbol']} | BUY {t['entry']:.0f} | SELL {t['exit']:.0f} | Rs {t['net_pnl']:+,.0f}")
+        lines.append(f"Win: {wins}/{len(trades)} | Costs: Rs {sum(t.get('costs',0) for t in trades):.0f}")
+        msg = "\n".join(lines)
+        logger.info(msg)
+        send_telegram(msg, config)
 
 
 # ================================================================
@@ -320,12 +308,11 @@ def run_one_day(config, symbols):
     logger.info(f"\n{'='*60}")
     logger.info(f"  RAJAN STOCK BOT — {today} ({today.strftime('%A')})")
     logger.info(f"{'='*60}")
-    send_telegram(f"🟢 *Bot waking up* — {today.strftime('%A, %B %d')}", config)
 
     if not is_market_day():
         msg = f"📅 {today.strftime('%A')} — Market closed. Sleeping until next trading day."
         logger.info(msg)
-        send_telegram(msg, config)
+        logger.info(msg)
         return
 
     # Wait for pre-market time
@@ -344,7 +331,6 @@ def run_one_day(config, symbols):
         logger.error(error_msg, exc_info=True)
         send_telegram(error_msg, config)
 
-    send_telegram("💤 *Bot sleeping* until next trading day.", config)
 
 
 def main():
@@ -374,15 +360,7 @@ def main():
     ╚══════════════════════════════════════════════════╝
     """.format(config["capital"]["total"], len(symbols)))
 
-    send_telegram(
-        "🚀 *Rajan Stock Bot Started!*\n\n"
-        f"Capital: ₹{config['capital']['total']:,}\n"
-        f"Stocks: {len(symbols)}\n"
-        f"Mode: PAPER (test)\n\n"
-        "Bot will wake at 8:50 AM and start trading at 9:15 AM.\n"
-        "You'll get Telegram alerts for every step.",
-        config
-    )
+    # Bot started silently — only trades + summary go to Telegram
 
     if args.once:
         run_one_day(config, symbols)

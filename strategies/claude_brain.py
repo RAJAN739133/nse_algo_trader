@@ -39,7 +39,9 @@ class ClaudeBrain:
         else:
             self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
 
-        self.enabled = bool(self.api_key) and self.api_key not in ("", "YOUR_ANTHROPIC_API_KEY")
+        self.enabled = bool(self.api_key) and self.api_key not in (
+            "", "YOUR_ANTHROPIC_API_KEY", "PASTE_YOUR_ANTHROPIC_API_KEY_HERE", "TEST_KEY"
+        )
 
         if config and not config.get("claude", {}).get("enabled", True):
             self.enabled = False
@@ -81,6 +83,13 @@ Return JSON only:
                 timeout=30,
             )
             data = resp.json()
+            # Check for API errors (billing, auth, etc.)
+            if "error" in data:
+                err_msg = data["error"].get("message", "Unknown API error")
+                logger.warning(f"Claude API error: {err_msg}")
+                if "credit" in err_msg.lower() or "billing" in err_msg.lower():
+                    logger.warning("  → Add credits at console.anthropic.com/settings/plans")
+                return self._default_response(vix)
             text = data.get("content", [{}])[0].get("text", "{}")
             # Parse JSON from response
             result = json.loads(text.strip().strip("```json").strip("```"))

@@ -139,11 +139,20 @@ def main():
     parser.add_argument("--from", dest="from_date", help="Start date for range")
     parser.add_argument("--to", dest="to_date", help="End date for range")
     parser.add_argument("--last", type=int, help="Test last N trading days")
-    parser.add_argument("--stocks", nargs="+", default=None)
-    parser.add_argument("--source", default=None, help="Override data source")
+    parser.add_argument("--stocks", nargs="+", default=None, help="Specific stock symbols")
+    parser.add_argument("--universe", default="nifty50", choices=["nifty50","nifty100","nifty250"],
+                        help="Stock universe: nifty50 (default), nifty100, nifty250")
+    parser.add_argument("--source", default=None, help="Override data source (yfinance/synthetic/kaggle)")
     args = parser.parse_args()
 
-    symbols = args.stocks or DEFAULT_UNIVERSE[:10]
+    # Pick stocks based on --stocks or --universe
+    from config.symbols import get_universe
+    if args.stocks:
+        symbols = args.stocks
+    else:
+        symbols = get_universe(args.universe)
+
+    logger.info(f"  Universe: {args.universe} ({len(symbols)} stocks)")
     loader = DataLoader()
 
     # Override source if specified

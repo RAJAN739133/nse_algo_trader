@@ -126,9 +126,9 @@ class LivePaperTrader:
         self.positions[sym] = {"entry": price, "qty": qty, "sl": sl, "target": target,
                                "strat": strat, "time": datetime.now().strftime("%H:%M"), "cost": cost, "high": price}
         self.trade_count += 1
-        msg = f"BUY {sym} @ Rs {price:.2f} x{qty}\nSL: Rs {sl:.2f} | TGT: Rs {target:.2f}\nStrategy: {strat}"
-        logger.info(f"  📈 {msg}")
-        send_telegram(f"📈 *{msg}*", self.config)
+        msg = f"📈 {sym} | BUY {price:.0f} x{qty} | SL {sl:.0f} | TGT {target:.0f}"
+        logger.info(f"  {msg}")
+        send_telegram(msg, self.config)
         return True
 
     def sell(self, sym, price, reason):
@@ -143,9 +143,9 @@ class LivePaperTrader:
                             "exit_time": datetime.now().strftime("%H:%M"),
                             "gross": round(gross, 2), "costs": round(costs, 2), "net_pnl": round(net, 2), "reason": reason})
         emoji = "✅" if net > 0 else "❌"
-        msg = f"SELL {sym} @ Rs {price:.2f}\nP&L: Rs {net:+,.2f} | {reason}"
-        logger.info(f"  {emoji} {msg}")
-        send_telegram(f"{emoji} *{msg}*", self.config)
+        msg = f"{emoji} {sym} | BUY {p['entry']:.0f} | SELL {price:.0f} | Rs {net:+,.0f} | {reason}"
+        logger.info(f"  {msg}")
+        send_telegram(msg, self.config)
 
     def check_stops(self, quotes):
         for sym in list(self.positions):
@@ -200,9 +200,10 @@ class LivePaperTrader:
             if q: self.sell(sym, q["price"], "SQUARE_OFF_3:10PM")
 
 
-def run():
+def run(symbols=None):
     config = load_config()
-    symbols = DEFAULT_UNIVERSE[:10]
+    if not symbols:
+        symbols = DEFAULT_UNIVERSE[:10]
     trader = LivePaperTrader(config)
 
     logger.info(f"\n{'='*60}")
@@ -219,9 +220,21 @@ def run():
         with open(model_path, "rb") as f:
             d = pickle.load(f)
         model, features = d["model"], d["features"]
-        logger.info(f"  ML model loaded")
+        import datetime
+        age = datetime.datetime.now() - datetime.datetime.fromtimestamp(model_path.stat().st_mtime)
+        logger.info(f"  ML model loaded (age: {age.days}d {age.seconds//3600}h)")
+        if age.days > 7:
+            logger.warning(f"  ⚠️ Model is {age.days} days old — consider retraining")
     else:
-        logger.info(f"  No ML model found — run: python -m data.train_pipeline demo")
+        logger.info(f"  No ML model found — auto-training on synthetic data...")
+        try:
+            from data.train_pipeline import generate_synthetic, add_features, train_model
+            raw = generate_synthetic(symbols[:10], years=10)
+            featured = pd.concat([add_features(raw[raw["symbol"]==s].copy()) for s in raw["symbol"].unique()])
+            model, features = train_model(featured)
+            logger.info(f"  ✅ Model auto-trained and saved")
+        except Exception as e:
+            logger.warning(f"  Model training failed: {e} — running without ML scoring")
 
     # ── Get VIX ──
     vix = fetch_vix()
@@ -229,7 +242,9 @@ def run():
     if vix > config["filters"]["vix_skip_threshold"]:
         msg = f"VIX {vix} too high — NO TRADING TODAY"
         logger.warning(f"  {msg}")
-        send_telegram(f"⚠️ *{msg}*", config)
+    # Send only if sitting out entirely
+    if not candidates:
+        send_telegram(f"📋 {date.today()} | No candidates | Sitting out", config)
         return
 
     # ── Pre-market scan ──
@@ -381,6 +396,11 @@ if __name__ == "__main__":
     ╚══════════════════════════════════════════════════╝
     """)
     try:
-        run()
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--universe", default="nifty50", choices=["nifty50","nifty100","nifty250"])
+        args = parser.parse_args()
+        from config.symbols import get_universe
+        run(get_universe(args.universe))
     except KeyboardInterrupt:
         print("\n  Stopped by user. Check results/ for any saved trades.")

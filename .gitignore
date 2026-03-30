@@ -23,8 +23,11 @@ data/kaggle/
 data/cache/
 data/custom/
 data/*.csv
-models/*.pkl
 models/*.json
+models/*.pkl
+
+# Results (local testing output)
+results/
 
 # Logs
 logs/
