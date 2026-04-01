@@ -37,6 +37,7 @@ from data.train_pipeline import add_features, score_stocks, FEATURE_COLS
 from backtest.costs import ZerodhaCostModel
 from strategies.pro_strategy_v2 import ProStrategyV2
 from strategies.claude_brain import ClaudeBrain
+from strategies.claude_brain_v2 import ClaudeBrainV2
 
 Path("logs").mkdir(exist_ok=True)
 Path("results").mkdir(exist_ok=True)
@@ -927,27 +928,28 @@ def run(symbols=None, backtest_date=None):
         send_telegram(msg, config)
         return
 
-    # ── Claude Brain morning analysis ──
-    brain = ClaudeBrain(config=config)
+    # ── Claude Brain V2 morning analysis ──
+    brain = ClaudeBrainV2(config=config)
     brain_advice = None
     if brain.enabled and not is_backtest:
-        logger.info("  🧠 Consulting Claude Brain...")
-        brain_advice = brain.get_morning_analysis(
-            vix=vix, fii_net=0, recent_trades=[], stock_scores=[]
-        )
+        logger.info("  🧠 Consulting Claude Brain V2...")
+        brain_advice = brain.morning_analysis(vix=vix, stock_scores=[])
         if brain_advice:
             logger.info(f"  🧠 Claude says: {brain_advice.get('risk_level', 'N/A')} | "
                         f"Max trades: {brain_advice.get('max_trades', 'N/A')} | "
-                        f"{brain_advice.get('notes', '')}")
+                        f"Sentiment: {brain_advice.get('news_sentiment', 'N/A')} | "
+                        f"{brain_advice.get('market_outlook', '')}")
             send_telegram(
-                f"🧠 Claude Brain — {today_str}\n"
+                f"🧠 Claude Brain V2 — {today_str}\n"
                 f"Risk: {brain_advice.get('risk_level', 'N/A')}\n"
+                f"Sentiment: {brain_advice.get('news_sentiment', 'N/A')}\n"
                 f"Max trades: {brain_advice.get('max_trades', 'N/A')}\n"
                 f"Skip: {brain_advice.get('skip_stocks', [])}\n"
+                f"Prefer: {brain_advice.get('preferred_stocks', [])}\n"
+                f"Outlook: {brain_advice.get('market_outlook', '')}\n"
                 f"Notes: {brain_advice.get('notes', '')}",
                 config,
             )
-            # Apply Claude's max_trades to config
             if brain_advice.get("max_trades"):
                 config["capital"]["max_trades_per_day"] = brain_advice["max_trades"]
 
@@ -1069,6 +1071,37 @@ def run(symbols=None, backtest_date=None):
                 send_telegram(status_msg, config)
                 last_status = now_t
 
+                # ── Claude Brain V2: Live adjustment every 15 min ──
+                if brain.enabled:
+                    try:
+                        live_state = {
+                            "time": now_t.strftime("%H:%M"),
+                            "vix": vix,
+                            "day_pnl": total_pnl,
+                            "trades_taken": closed,
+                            "open_positions": [
+                                {"symbol": s, "side": t.side, "pnl": t.day_pnl, "regime": t.current_regime}
+                                for s, t in traders.items() if t.in_trade
+                            ],
+                            "stock_regimes": regimes,
+                        }
+                        adj = brain.live_adjustment(live_state)
+                        if adj and adj.get("emergency_exits"):
+                            for sym_exit in adj["emergency_exits"]:
+                                if sym_exit in traders and traders[sym_exit].in_trade:
+                                    logger.warning(f"  🧠 EMERGENCY EXIT: {sym_exit}")
+                                    candles_ex = fetch_intraday_candles(sym_exit, broker=broker)
+                                    if candles_ex is not None and len(candles_ex) > 0:
+                                        traders[sym_exit]._close_trade(
+                                            candles_ex.iloc[-1]["close"],
+                                            pd.to_datetime(candles_ex.iloc[-1]["datetime"]),
+                                            "CLAUDE_EMERGENCY"
+                                        )
+                        if adj and adj.get("notes") and adj["notes"] != "No live adjustment":
+                            logger.info(f"  🧠 Brain: {adj['notes']}")
+                    except Exception as brain_err:
+                        logger.debug(f"Brain live adjustment error: {brain_err}")
+
             time.sleep(poll_interval)
 
     # ── End of day summary ──
@@ -1116,7 +1149,7 @@ def run(symbols=None, backtest_date=None):
 
     # ── Claude Brain EOD analysis ──
     if brain.enabled and all_trades and not is_backtest:
-        eod = brain.get_eod_analysis(all_trades, total_pnl)
+        eod = brain.eod_analysis(all_trades, total_pnl, {})
         if eod:
             logger.info(f"  🧠 Claude EOD: {eod}")
 
