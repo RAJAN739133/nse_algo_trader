@@ -1,0 +1,14 @@
+# Angel One SmartAPI Configuration
+# Get creds from: https://smartapi.angelone.in/
+angel_one:
+  api_key: "z5XcNUgK"
+  client_code: "AACG291006"
+  pin: "7391"
+  totp_secret: "YQ4OEKNLKTMOG5DLNAKUJODCP4"
+  websocket:
+    mode: 3
+    max_retry_attempt: 5
+    retry_delay: 10
+    retry_multiplier: 2
+    retry_duration: 30
+  instrument_url: "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"

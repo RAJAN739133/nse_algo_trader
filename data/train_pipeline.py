@@ -25,11 +25,14 @@ FEATURE_COLS = [
     "bb_pos","rsi_14","rsi_7","macd_hist","vol_ratio","candle_score",
     "pat_hammer","pat_shooting_star","pat_engulf_bull","pat_engulf_bear",
     "pat_morning_star","pat_evening_star","pat_3_white","pat_3_black",
+    # V3 NSE bhavcopy enrichment features
+    "delivery_pct","delivery_pct_sma5","delivery_pct_change",
+    "vwap_premium","trade_intensity","trade_intensity_sma5",
 ]
 
 
 def add_features(df):
-    """30+ indicators + 12 candlestick patterns."""
+    """30+ indicators + 12 candlestick patterns + NSE bhavcopy enrichment."""
     df = df.sort_values("date").copy()
     c, h, l, o = df["close"], df["high"], df["low"], df["open"]
     df["ret_1d"] = c.pct_change()
@@ -81,6 +84,22 @@ def add_features(df):
     df["pat_3_black"] = -((c<o)&(c.shift(1)<o.shift(1))&(c.shift(2)<o.shift(2))&(c<c.shift(1))&(c.shift(1)<c.shift(2))).astype(int)
     pcols = [x for x in df.columns if x.startswith("pat_")]
     df["candle_score"] = df[pcols].sum(axis=1)
+    # NSE bhavcopy enrichment — delivery %, VWAP premium, trade intensity
+    if "delivery_pct" not in df.columns:
+        df["delivery_pct"] = 0.0
+    if "nse_vwap" not in df.columns:
+        df["vwap_premium"] = 0.0
+    else:
+        df["vwap_premium"] = (c - df["nse_vwap"]) / df["nse_vwap"]
+    if "no_of_trades" not in df.columns:
+        df["trade_intensity"] = 0.0
+    else:
+        df["trade_intensity"] = df["no_of_trades"] / df["no_of_trades"].rolling(20).mean().replace(0, np.nan)
+    df["delivery_pct_sma5"] = df["delivery_pct"].rolling(5).mean()
+    df["delivery_pct_change"] = df["delivery_pct"].pct_change().replace([np.inf, -np.inf], 0.0)
+    df["trade_intensity_sma5"] = df["trade_intensity"].rolling(5).mean()
+    # ── Sanitize: kill all inf values before ML sees them ──
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df["target_dir"] = (c.shift(-1)/c - 1 > 0).astype(int)
     return df
 
@@ -111,7 +130,8 @@ def train_model(df):
     from sklearn.metrics import accuracy_score
     avail = [c for c in FEATURE_COLS if c in df.columns]
     mdf = df.dropna(subset=avail+["target_dir"]).copy()
-    X, y = mdf[avail].fillna(0), mdf["target_dir"]
+    X = mdf[avail].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y = mdf["target_dir"]
     print(f"  Features: {len(avail)} | Samples: {len(X):,} | Up: {y.mean():.1%}")
     tscv = TimeSeriesSplit(n_splits=3)
     for fold,(tri,tei) in enumerate(tscv.split(X),1):
@@ -132,30 +152,80 @@ def train_model(df):
 
 
 def score_stocks(df, model=None, features=None, vix=15):
+    """
+    Bidirectional scoring — scores stocks for BOTH long and short setups.
+    Each stock gets a long_score and short_score; the higher one wins.
+    Returns direction='LONG' or 'SHORT' for each pick.
+    """
     scores = []
     for sym in df["symbol"].unique():
         s = df[df["symbol"]==sym]
         if len(s) < 50: continue
-        lat = s.iloc[-1]; sc = 0
+        lat = s.iloc[-1]
+        rsi = lat.get("rsi_14",50)
+        vr = lat.get("vol_ratio",1.0); vr = 1.0 if pd.isna(vr) else vr
+        candle = lat.get("candle_score",0)
+
+        # ── ML component (shared) ──
+        ml_bull, ml_bear = 15, 15
         if model and features:
             try:
-                x = np.nan_to_num(lat[features].values.reshape(1,-1))
-                sc += int(model.predict_proba(x)[0][1]*30)
-            except: sc += 15
-        tech = 0
-        if lat.get("price_vs_sma20",0)>0: tech+=5
-        if lat.get("price_vs_sma50",0)>0: tech+=5
-        if lat.get("sma20_vs_sma50",0)>0: tech+=5
-        rsi = lat.get("rsi_14",50)
-        tech += 10 if rsi<30 else (8 if rsi<40 else (5 if rsi<60 else 0))
-        sc += min(25,tech)
-        sc += min(15, max(0, int(lat.get("candle_score",0)*5+7)))
-        vr = lat.get("vol_ratio",1.0); vr = 1.0 if pd.isna(vr) else vr
-        sc += min(15, int(min(vr,3)*5))
-        sc += max(0, min(15, 12 if vix<15 else (7 if vix<20 else 4)))
-        scores.append({"symbol":sym,"score":min(100,sc),"price":round(lat.get("close",0),2),
-            "rsi":round(rsi,1),"strategy":"ORB" if rsi>35 else "VWAP"})
-    return pd.DataFrame(scores).sort_values("score",ascending=False)
+                x = lat[features].values.astype(np.float64).reshape(1,-1)
+                x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                prob_up = model.predict_proba(x)[0][1]
+                ml_bull = int(prob_up * 30)
+                ml_bear = int((1 - prob_up) * 30)
+            except: pass
+
+        # ── VIX component (shared) ──
+        vix_sc = max(0, min(15, 12 if vix<15 else (7 if vix<20 else 4)))
+
+        # ── Volume component (shared) ──
+        vol_sc = min(15, int(min(vr,3)*5))
+
+        # ════════════════════════════════════════
+        # LONG SCORE (bullish setup)
+        # ════════════════════════════════════════
+        long_tech = 0
+        if lat.get("price_vs_sma20",0) > 0: long_tech += 5
+        if lat.get("price_vs_sma50",0) > 0: long_tech += 5
+        if lat.get("sma20_vs_sma50",0) > 0: long_tech += 5
+        long_tech += 10 if rsi<30 else (8 if rsi<40 else (5 if rsi<60 else 0))
+        long_candle = min(15, max(0, int(candle*5+7))) if candle >= 0 else 0
+        long_sc = ml_bull + min(25, long_tech) + long_candle + vol_sc + vix_sc
+
+        # ════════════════════════════════════════
+        # SHORT SCORE (bearish setup)
+        # ════════════════════════════════════════
+        short_tech = 0
+        if lat.get("price_vs_sma20",0) < 0: short_tech += 5    # below SMA20
+        if lat.get("price_vs_sma50",0) < 0: short_tech += 5    # below SMA50
+        if lat.get("sma20_vs_sma50",0) < 0: short_tech += 5    # death cross
+        short_tech += 10 if rsi>70 else (8 if rsi>60 else (5 if rsi>50 else 0))  # overbought
+        short_candle = min(15, max(0, int((-candle)*5+7))) if candle <= 0 else 0  # bearish patterns
+        short_sc = ml_bear + min(25, short_tech) + short_candle + vol_sc + vix_sc
+
+        # ── Pick best direction ──
+        if long_sc >= short_sc:
+            direction = "LONG"
+            best_sc = long_sc
+            strat = "ORB" if rsi > 35 else "VWAP"
+        else:
+            direction = "SHORT"
+            best_sc = short_sc
+            strat = "ORB" if rsi < 65 else "VWAP"
+
+        scores.append({
+            "symbol": sym,
+            "score": min(100, best_sc),
+            "long_score": min(100, long_sc),
+            "short_score": min(100, short_sc),
+            "direction": direction,
+            "price": round(lat.get("close",0), 2),
+            "rsi": round(rsi, 1),
+            "strategy": strat,
+        })
+    return pd.DataFrame(scores).sort_values("score", ascending=False)
 
 
 def main():
@@ -189,13 +259,17 @@ def main():
             model,feats = d["model"],d["features"]
         elif action=="score": model,feats = None,None
         sc = score_stocks(featured, model if 'model' in dir() else None, feats if 'feats' in dir() else None)
-        print(f"\n  {'Rank':<5}{'Symbol':<12}{'Score':>6}{'RSI':>6}{'Strategy':<8}")
-        print("  "+"-"*40)
+        print(f"\n  {'Rank':<5}{'Symbol':<12}{'Score':>6}{'RSI':>6} {'Dir':<6}{'Strategy':<8}")
+        print("  "+"-"*48)
         for i,(_,r) in enumerate(sc.head(15).iterrows(),1):
             star = " *" if r["score"]>=60 else ""
-            print(f"  {i:<5}{r['symbol']:<12}{r['score']:>5.0f}{r['rsi']:>6.1f} {r['strategy']:<8}{star}")
+            d = r.get("direction","LONG")
+            arrow = "▲" if d=="LONG" else "▼"
+            print(f"  {i:<5}{r['symbol']:<12}{r['score']:>5.0f}{r['rsi']:>6.1f} {arrow} {d:<5} {r['strategy']:<8}{star}")
         picks = sc[sc["score"]>=60].head(3)
         print(f"\n  TODAY'S PICKS: {len(picks)} stocks" if len(picks) else "\n  No stocks qualify — sit out")
-        for _,p in picks.iterrows(): print(f"    {p['symbol']} score={p['score']} via {p['strategy']}")
+        for _,p in picks.iterrows():
+            d = p.get("direction","LONG")
+            print(f"    {p['symbol']} score={p['score']} via {p['strategy']} → {d}")
 
 if __name__ == "__main__": main()

@@ -81,4 +81,16 @@ class VWAPv2Strategy:
                     reason=f"Oversold bounce: RSI={rsi:.0f}, price below VWAP-1σ"
                 )
 
+        # Overbought rejection (RSI > 65, price above upper band) — SHORT
+        if rsi > 65 and price > upper_band:
+            # Trend alignment: short-term EMA should confirm weakness
+            if ema10 < ema20 * 1.002:  # allow slight lag
+                sl = vwap + std * 2
+                return TradeSignal(
+                    signal=Signal.SELL, symbol=symbol, entry_price=price,
+                    stop_loss=sl, target_price=vwap,
+                    strategy_name="VWAP_v2", confidence=0.6,
+                    reason=f"Overbought rejection: RSI={rsi:.0f}, price above VWAP+1σ"
+                )
+
         return None

@@ -64,14 +64,16 @@ def run_single_day(target_date, symbols, loader, model=None, features=None):
 
     # Show scores
     logger.info(f"\n  Stock scores for {target_date}:")
-    logger.info(f"  {'Symbol':<12}{'Score':>6}{'RSI':>6}{'Strategy':<8}")
+    logger.info(f"  {'Symbol':<12}{'Score':>6}{'RSI':>6} {'Dir':<6}{'Strategy':<8}")
     for _, r in scores.head(10).iterrows():
         star = " <-- TRADE" if r["score"] >= 60 else ""
-        logger.info(f"  {r['symbol']:<12}{r['score']:>5.0f}{r['rsi']:>6.1f} {r['strategy']:<8}{star}")
+        d = r.get("direction","LONG")
+        arrow = "▲" if d=="LONG" else "▼"
+        logger.info(f"  {r['symbol']:<12}{r['score']:>5.0f}{r['rsi']:>6.1f} {arrow}{d:<5} {r['strategy']:<8}{star}")
 
-    picks = scores[scores["score"] >= 60].head(3)
+    picks = scores[scores["score"] >= 50].head(3)
     if picks.empty:
-        logger.info(f"\n  No stocks scored >= 60. Algo sits out today.")
+        logger.info(f"\n  No stocks scored >= 50. Algo sits out today.")
         return []
 
     # Simulate trades for picked stocks
@@ -98,37 +100,80 @@ def run_single_day(target_date, symbols, loader, model=None, features=None):
         low = last_day["low"]
         atr = last_day.get("atr_14", abs(high - low))
 
-        # Simulate ORB-style trade
-        sl = entry - atr * 1.5
-        target = entry + atr * 2.0
+        # Simulate trade based on direction
+        direction = pick.get("direction", "LONG")
 
-        # What would have happened?
-        if high >= target:
-            exit_price = target
-            reason = "TARGET"
-        elif low <= sl:
-            exit_price = sl
-            reason = "STOP_LOSS"
+        if direction == "SHORT":
+            # SHORT trade
+            sl = entry + atr * 1.5
+            target = entry - atr * 2.0
+
+            if low <= target:
+                exit_price = target
+                reason = "TARGET"
+            elif high >= sl:
+                exit_price = sl
+                reason = "STOP_LOSS"
+            else:
+                exit_price = close
+                reason = "SQUARE_OFF"
+
+            risk = sl - entry
+            qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
+            gross = (entry - exit_price) * qty
         else:
-            exit_price = close  # square off at close
-            reason = "SQUARE_OFF"
+            # LONG trade
+            sl = entry - atr * 1.5
+            target = entry + atr * 2.0
 
-        risk = entry - sl
-        qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
-        gross = (exit_price - entry) * qty
+            if high >= target:
+                exit_price = target
+                reason = "TARGET"
+            elif low <= sl:
+                exit_price = sl
+                reason = "STOP_LOSS"
+            else:
+                exit_price = close
+                reason = "SQUARE_OFF"
+
+            risk = entry - sl
+            qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
+            gross = (exit_price - entry) * qty
+
         costs = cost_model.calculate(entry * qty, exit_price * qty).total
         net = gross - costs
 
+        # Simulate intraday times based on strategy + exit reason
+        if direction == "SHORT":
+            entry_time = f"{target_date} 09:35"  # ORB short after range forms
+            if reason == "STOP_LOSS":
+                exit_time = f"{target_date} 10:15"
+            elif reason == "TARGET":
+                exit_time = f"{target_date} 11:30"
+            else:
+                exit_time = f"{target_date} 15:10"
+        else:
+            entry_time = f"{target_date} 09:32"  # ORB long after breakout
+            if reason == "STOP_LOSS":
+                exit_time = f"{target_date} 10:05"
+            elif reason == "TARGET":
+                exit_time = f"{target_date} 12:00"
+            else:
+                exit_time = f"{target_date} 15:10"
+
         trade = {
             "date": str(target_date), "symbol": sym, "strategy": pick["strategy"],
+            "direction": direction,
             "score": pick["score"], "entry": round(entry, 2), "exit": round(exit_price, 2),
             "sl": round(sl, 2), "target": round(target, 2), "qty": qty,
+            "entry_time": entry_time, "exit_time": exit_time,
             "gross_pnl": round(gross, 2), "costs": round(costs, 2),
             "net_pnl": round(net, 2), "reason": reason,
         }
         trades.append(trade)
         emoji = "WIN " if net > 0 else "LOSS"
-        logger.info(f"\n  {emoji} {sym} @ {entry:.2f} -> {exit_price:.2f} | Rs {net:+,.2f} | {reason}")
+        side_label = "SHORT" if direction == "SHORT" else "LONG"
+        logger.info(f"\n  {emoji} {sym} {side_label} | Entry: {entry_time} @ Rs {entry:.2f} | Exit: {exit_time} @ Rs {exit_price:.2f} | Rs {net:+,.2f} | {reason}")
 
     return trades
 

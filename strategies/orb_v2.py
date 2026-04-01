@@ -56,9 +56,16 @@ class ORBv2Strategy:
                         strategy_name="ORB_v2_GAP_REV", confidence=0.7,
                         reason=f"Gap-up reversal: open={open_price:.2f} was day low, now recovering"
                     )
-            # Gap down but open = day high → bearish (skip for intraday long-only)
+            # Gap down but open = day high → bearish breakdown signal
             if gap_pct < -0.8 and abs(open_price - candles_1m["high"].max()) < orb_range * 0.1:
-                return None  # don't short in intraday for now
+                if price < open_price * 0.998:  # confirmed weakness
+                    sl = candles_1m["high"].max() + orb_range * 0.3
+                    return TradeSignal(
+                        signal=Signal.SELL, symbol=symbol, entry_price=price,
+                        stop_loss=sl, target_price=price - (sl - price) * 1.5,
+                        strategy_name="ORB_v2_GAP_REV", confidence=0.7,
+                        reason=f"Gap-down reversal: open={open_price:.2f} was day high, now breaking down"
+                    )
 
         # === Pullback False Breakout Filter ===
         if gap_pct > 1.5 and len(candles_1m) > 15:
@@ -84,6 +91,18 @@ class ORBv2Strategy:
                 stop_loss=sl, target_price=target,
                 strategy_name="ORB_v2", confidence=0.65,
                 reason=f"Breakout above ORB high {orb_high:.2f}"
+            )
+
+        # === Standard ORB Breakdown (SHORT) ===
+        if price < orb_low * 0.999:
+            atr = orb_range * self.atr_mult
+            sl = price + atr
+            target = price - atr * 1.5
+            return TradeSignal(
+                signal=Signal.SELL, symbol=symbol, entry_price=price,
+                stop_loss=sl, target_price=target,
+                strategy_name="ORB_v2", confidence=0.65,
+                reason=f"Breakdown below ORB low {orb_low:.2f}"
             )
 
         return None

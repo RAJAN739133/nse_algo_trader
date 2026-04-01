@@ -87,18 +87,24 @@ def fetch_vix():
 
 
 def send_telegram(msg, config):
-    """Send alert to Telegram."""
+    """Send alert to Telegram (supports multiple recipients)."""
     alerts = config.get("alerts", {})
     if not alerts.get("telegram_enabled"): return
     token = alerts.get("telegram_bot_token", "")
-    chat_id = alerts.get("telegram_chat_id", "")
-    if not token or not chat_id: return
+    chat_ids = alerts.get("telegram_chat_ids", [])
+    single_id = alerts.get("telegram_chat_id", "")
+    if single_id and single_id not in chat_ids:
+        chat_ids.append(single_id)
+    if not token or not chat_ids: return
     try:
         import urllib.request
-        data = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
-        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
-                                     data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
+        for chat_id in chat_ids:
+            if not chat_id:
+                continue
+            data = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
+            req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
+                                         data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         logger.warning(f"Telegram send failed: {e}")
 
@@ -124,28 +130,72 @@ class LivePaperTrader:
             return False
         cost = self.cost_model.total_cost(price, qty, "intraday")
         self.positions[sym] = {"entry": price, "qty": qty, "sl": sl, "target": target,
-                               "strat": strat, "time": datetime.now().strftime("%H:%M"), "cost": cost, "high": price}
+                               "strat": strat, "side": "LONG",
+                               "time": datetime.now().strftime("%H:%M"), "cost": cost, "high": price, "low": price}
         self.trade_count += 1
-        msg = f"📈 {sym} | BUY {price:.0f} x{qty} | SL {sl:.0f} | TGT {target:.0f}"
+        msg = f"📈 {sym} | BUY @ Rs {price:,.2f} x{qty} | SL Rs {sl:,.2f} | TGT Rs {target:,.2f}"
+        logger.info(f"  {msg}")
+        send_telegram(msg, self.config)
+        return True
+
+    def short_sell(self, sym, price, qty, sl, target, strat):
+        """Enter a SHORT position — sell first, buy later to cover."""
+        if sym in self.positions or self.trade_count >= self.max_trades:
+            return False
+        if self.pnl < -self.capital * self.config["capital"]["daily_loss_limit"]:
+            logger.warning(f"  Daily loss limit hit! No more trades.")
+            return False
+        cost = self.cost_model.total_cost(price, qty, "intraday")
+        self.positions[sym] = {"entry": price, "qty": qty, "sl": sl, "target": target,
+                               "strat": strat, "side": "SHORT",
+                               "time": datetime.now().strftime("%H:%M"), "cost": cost, "high": price, "low": price}
+        self.trade_count += 1
+        msg = f"📉 {sym} | SHORT @ Rs {price:,.2f} x{qty} | SL Rs {sl:,.2f} | TGT Rs {target:,.2f}"
         logger.info(f"  {msg}")
         send_telegram(msg, self.config)
         return True
 
     def sell(self, sym, price, reason):
+        """Exit a LONG position."""
         if sym not in self.positions: return
         p = self.positions.pop(sym)
         gross = (price - p["entry"]) * p["qty"]
         costs = p["cost"] + self.cost_model.total_cost(price, p["qty"], "intraday")
         net = gross - costs
         self.pnl += net
-        self.closed.append({"symbol": sym, "strategy": p["strat"], "entry": p["entry"],
+        self.closed.append({"symbol": sym, "strategy": p["strat"], "side": "LONG", "entry": p["entry"],
                             "exit": round(price, 2), "qty": p["qty"], "entry_time": p["time"],
                             "exit_time": datetime.now().strftime("%H:%M"),
                             "gross": round(gross, 2), "costs": round(costs, 2), "net_pnl": round(net, 2), "reason": reason})
         emoji = "✅" if net > 0 else "❌"
-        msg = f"{emoji} {sym} | BUY {p['entry']:.0f} | SELL {price:.0f} | Rs {net:+,.0f} | {reason}"
+        msg = f"{emoji} {sym} | BUY Rs {p['entry']:,.2f} → SELL Rs {price:,.2f} | P&L: Rs {net:+,.2f} | {reason}"
         logger.info(f"  {msg}")
         send_telegram(msg, self.config)
+
+    def cover(self, sym, price, reason):
+        """Exit a SHORT position — buy to cover."""
+        if sym not in self.positions: return
+        p = self.positions.pop(sym)
+        gross = (p["entry"] - price) * p["qty"]  # profit when price falls
+        costs = p["cost"] + self.cost_model.total_cost(price, p["qty"], "intraday")
+        net = gross - costs
+        self.pnl += net
+        self.closed.append({"symbol": sym, "strategy": p["strat"], "side": "SHORT", "entry": p["entry"],
+                            "exit": round(price, 2), "qty": p["qty"], "entry_time": p["time"],
+                            "exit_time": datetime.now().strftime("%H:%M"),
+                            "gross": round(gross, 2), "costs": round(costs, 2), "net_pnl": round(net, 2), "reason": reason})
+        emoji = "✅" if net > 0 else "❌"
+        msg = f"{emoji} {sym} | SHORT Rs {p['entry']:,.2f} → COVER Rs {price:,.2f} | P&L: Rs {net:+,.2f} | {reason}"
+        logger.info(f"  {msg}")
+        send_telegram(msg, self.config)
+
+    def close_position(self, sym, price, reason):
+        """Close any position (LONG or SHORT) based on its side."""
+        if sym not in self.positions: return
+        if self.positions[sym]["side"] == "SHORT":
+            self.cover(sym, price, reason)
+        else:
+            self.sell(sym, price, reason)
 
     def check_stops(self, quotes):
         for sym in list(self.positions):
@@ -153,12 +203,27 @@ class LivePaperTrader:
             if not q: continue
             p = self.positions[sym]
             px = q["price"]
-            if px > p["high"]: p["high"] = px
-            if px <= p["sl"]: self.sell(sym, p["sl"], "STOP_LOSS")
-            elif px >= p["target"]: self.sell(sym, p["target"], "TARGET")
-            elif p["high"] > p["entry"] * 1.01:
-                trail = p["entry"] + (p["high"] - p["entry"]) * 0.5
-                if px <= trail and trail > p["sl"]: self.sell(sym, px, "TRAILING")
+
+            if p["side"] == "LONG":
+                if px > p["high"]: p["high"] = px
+                if px <= p["sl"]:
+                    self.sell(sym, p["sl"], "STOP_LOSS")
+                elif px >= p["target"]:
+                    self.sell(sym, p["target"], "TARGET")
+                elif p["high"] > p["entry"] * 1.01:
+                    trail = p["entry"] + (p["high"] - p["entry"]) * 0.5
+                    if px <= trail and trail > p["sl"]:
+                        self.sell(sym, px, "TRAILING")
+            else:  # SHORT
+                if px < p["low"]: p["low"] = px
+                if px >= p["sl"]:
+                    self.cover(sym, p["sl"], "STOP_LOSS")
+                elif px <= p["target"]:
+                    self.cover(sym, p["target"], "TARGET")
+                elif p["low"] < p["entry"] * 0.99:
+                    trail = p["entry"] - (p["entry"] - p["low"]) * 0.5
+                    if px >= trail and trail < p["sl"]:
+                        self.cover(sym, px, "TRAILING")
 
     def check_orb(self, sym, quote):
         if sym in self.orb_done or sym in self.positions: return
@@ -167,13 +232,24 @@ class LivePaperTrader:
         px = quote["price"]
         rng = orb["high"] - orb["low"]
         if rng < 1: return
+        atr = rng * self.config["strategies"]["orb"].get("atr_stop_multiplier", 1.5)
+
+        # LONG breakout: price above ORB high
         if px > orb["high"] * 1.001:
-            atr = rng * self.config["strategies"]["orb"].get("atr_stop_multiplier", 1.5)
             sl = px - atr
             target = px + atr * 1.5
             risk = px - sl
             qty = max(1, int(self.capital * self.config["capital"]["risk_per_trade"] / risk))
             if self.buy(sym, px, qty, sl, target, "ORB_v2"):
+                self.orb_done.add(sym)
+
+        # SHORT breakdown: price below ORB low
+        elif px < orb["low"] * 0.999:
+            sl = px + atr
+            target = px - atr * 1.5
+            risk = sl - px
+            qty = max(1, int(self.capital * self.config["capital"]["risk_per_trade"] / risk))
+            if self.short_sell(sym, px, qty, sl, target, "ORB_v2_SHORT"):
                 self.orb_done.add(sym)
 
     def check_vwap(self, sym, quote, vix):
@@ -186,7 +262,9 @@ class LivePaperTrader:
         mid = (hi + lo) / 2  # rough VWAP proxy
         band = (hi - lo) * 0.5
         if band < 1: return
-        if px < mid - band * 0.5:  # below lower band
+
+        # LONG: oversold bounce — price below lower band
+        if px < mid - band * 0.5:
             sl = mid - band
             target = mid
             risk = px - sl
@@ -194,10 +272,19 @@ class LivePaperTrader:
                 qty = max(1, int(self.capital * self.config["capital"]["risk_per_trade"] / risk))
                 self.buy(sym, px, qty, sl, target, "VWAP_v2")
 
+        # SHORT: overbought rejection — price above upper band
+        elif px > mid + band * 0.5:
+            sl = mid + band
+            target = mid
+            risk = sl - px
+            if risk > 0:
+                qty = max(1, int(self.capital * self.config["capital"]["risk_per_trade"] / risk))
+                self.short_sell(sym, px, qty, sl, target, "VWAP_v2_SHORT")
+
     def square_off(self, quotes):
         for sym in list(self.positions):
             q = quotes.get(sym)
-            if q: self.sell(sym, q["price"], "SQUARE_OFF_3:10PM")
+            if q: self.close_position(sym, q["price"], "SQUARE_OFF_3:10PM")
 
 
 def run(symbols=None):

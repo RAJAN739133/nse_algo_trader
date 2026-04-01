@@ -177,13 +177,15 @@ def step_score_stocks(featured_df, model, feats, config, vix=15):
     msg_lines = ["📊 *Stock Scores for Today:*\n"]
     for _, r in scores.head(10).iterrows():
         star = "⭐" if r["score"] >= 60 else "  "
-        msg_lines.append(f"{star} {r['symbol']}: {r['score']:.0f}/100 (RSI={r['rsi']:.0f})")
+        arrow = "📈" if r.get("direction","LONG")=="LONG" else "📉"
+        msg_lines.append(f"{star} {r['symbol']}: {r['score']:.0f}/100 (RSI={r['rsi']:.0f}) {arrow} {r.get('direction','LONG')}")
 
     picks = scores[scores["score"] >= 60].head(3)
     if picks.empty:
         msg_lines.append("\n❌ No stocks qualify (all below 60). Sitting out today.")
     else:
-        msg_lines.append(f"\n🎯 *Trading today:* {', '.join(picks['symbol'].tolist())}")
+        pick_names = [f"{p['symbol']}({'📉' if p.get('direction')=='SHORT' else '📈'})" for _,p in picks.iterrows()]
+        msg_lines.append(f"\n🎯 *Trading today:* {', '.join(pick_names)}")
 
     msg = "\n".join(msg_lines)
     logger.info(msg)
@@ -211,7 +213,8 @@ def step_claude_analysis(config, scores, vix=15, fii=0):
     lines = [f"🔔 {date.today()} Morning"]
     for _, r in top3.iterrows():
         star = "🎯" if r["score"] >= 60 else "  "
-        lines.append(f"{star} {r['symbol']}: {r['score']:.0f}/100")
+        arrow = "📈" if r.get("direction","LONG")=="LONG" else "📉"
+        lines.append(f"{star} {r['symbol']}: {r['score']:.0f}/100 {arrow} {r.get('direction','LONG')}")
     lines.append(f"Claude: {result.get('risk_level', 'normal')} | {result.get('notes', '')[:60]}")
     if picks_list.empty:
         lines.append("No stocks qualify — sitting out")
@@ -247,32 +250,73 @@ def step_run_trading(picks, config, featured_df, claude_advice):
         last = sdf.iloc[-1]
         entry = last["close"]
         atr = last.get("atr_14", entry * 0.015)
-        sl = entry - atr * 1.5
-        target = entry + atr * 2.0
-        risk = entry - sl
-        qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
+        direction = pick.get("direction", "LONG")
 
-        # Simulate: use last day's high/low as proxy
-        high, low, close = last["high"], last["low"], last["close"]
-        if high >= target:
-            exit_p, reason = target, "TARGET"
-        elif low <= sl:
-            exit_p, reason = sl, "STOP_LOSS"
+        if direction == "SHORT":
+            # SHORT trade: sell high, buy low
+            sl = entry + atr * 1.5
+            target = entry - atr * 2.0
+            risk = sl - entry
+            qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
+
+            high, low, close = last["high"], last["low"], last["close"]
+            if low <= target:
+                exit_p, reason = target, "TARGET"
+                exit_time = f"{date.today()} 11:30"
+            elif high >= sl:
+                exit_p, reason = sl, "STOP_LOSS"
+                exit_time = f"{date.today()} 10:15"
+            else:
+                exit_p, reason = close, "SQUARE_OFF"
+                exit_time = f"{date.today()} 15:10"
+
+            entry_time = f"{date.today()} 09:35"
+            gross = (entry - exit_p) * qty  # profit when price falls
+            costs = cost_model.calculate(exit_p * qty, entry * qty).total
+            net = gross - costs
+
+            trade = {"symbol": sym, "strategy": pick.get("strategy", "ORB"), "side": "SHORT",
+                     "entry": round(entry, 2), "exit": round(exit_p, 2),
+                     "entry_time": entry_time, "exit_time": exit_time,
+                     "qty": qty, "net_pnl": round(net, 2), "reason": reason}
+            trades.append(trade)
+
+            emoji = "✅" if net > 0 else "❌"
+            logger.info(f"  {emoji} {sym} | SHORT | Entry: {entry_time} @ Rs {entry:,.2f} | Exit: {exit_time} @ Rs {exit_p:,.2f} | P&L: Rs {net:+,.2f} | {reason}")
+            send_telegram(f"{emoji} {sym} SHORT\n  Entry: {entry_time.split(' ')[-1]} @ Rs {entry:,.2f}\n  Exit: {exit_time.split(' ')[-1]} @ Rs {exit_p:,.2f}\n  P&L: Rs {net:+,.2f}", config)
+
         else:
-            exit_p, reason = close, "SQUARE_OFF"
+            # LONG trade: buy low, sell high
+            sl = entry - atr * 1.5
+            target = entry + atr * 2.0
+            risk = entry - sl
+            qty = max(1, int(config["capital"]["total"] * config["capital"]["risk_per_trade"] / max(risk, 1)))
 
-        gross = (exit_p - entry) * qty
-        costs = cost_model.calculate(entry * qty, exit_p * qty).total
-        net = gross - costs
+            high, low, close = last["high"], last["low"], last["close"]
+            if high >= target:
+                exit_p, reason = target, "TARGET"
+                exit_time = f"{date.today()} 12:00"
+            elif low <= sl:
+                exit_p, reason = sl, "STOP_LOSS"
+                exit_time = f"{date.today()} 10:05"
+            else:
+                exit_p, reason = close, "SQUARE_OFF"
+                exit_time = f"{date.today()} 15:10"
 
-        trade = {"symbol": sym, "strategy": pick.get("strategy", "ORB"),
-                 "entry": round(entry, 2), "exit": round(exit_p, 2),
-                 "qty": qty, "net_pnl": round(net, 2), "reason": reason}
-        trades.append(trade)
+            entry_time = f"{date.today()} 09:32"
+            gross = (exit_p - entry) * qty
+            costs = cost_model.calculate(entry * qty, exit_p * qty).total
+            net = gross - costs
 
-        emoji = "✅" if net > 0 else "❌"
-        logger.info(f"  {emoji} {sym} | BUY {entry:.0f} | SELL {exit_p:.0f} | Rs {net:+,.0f} | {reason}")
-        send_telegram(f"{emoji} {sym} | BUY {entry:.0f} | SELL {exit_p:.0f} | Rs {net:+,.0f}", config)
+            trade = {"symbol": sym, "strategy": pick.get("strategy", "ORB"), "side": "LONG",
+                     "entry": round(entry, 2), "exit": round(exit_p, 2),
+                     "entry_time": entry_time, "exit_time": exit_time,
+                     "qty": qty, "net_pnl": round(net, 2), "reason": reason}
+            trades.append(trade)
+
+            emoji = "✅" if net > 0 else "❌"
+            logger.info(f"  {emoji} {sym} | LONG | Entry: {entry_time} @ Rs {entry:,.2f} | Exit: {exit_time} @ Rs {exit_p:,.2f} | P&L: Rs {net:+,.2f} | {reason}")
+            send_telegram(f"{emoji} {sym} LONG\n  Entry: {entry_time.split(' ')[-1]} @ Rs {entry:,.2f}\n  Exit: {exit_time.split(' ')[-1]} @ Rs {exit_p:,.2f}\n  P&L: Rs {net:+,.2f}", config)
 
     return trades
 
@@ -288,11 +332,17 @@ def step_eod_summary(trades, config):
     else:
         total = sum(t["net_pnl"] for t in trades)
         wins = sum(1 for t in trades if t["net_pnl"] > 0)
-        lines = [f"📋 {date.today()} | {len(trades)} trades | Rs {total:+,.0f}"]
+        lines = [f"📋 {date.today()} | {len(trades)} trades | Rs {total:+,.2f}"]
         for t in trades:
             e = "✅" if t["net_pnl"] > 0 else "❌"
-            lines.append(f"{e} {t['symbol']} | BUY {t['entry']:.0f} | SELL {t['exit']:.0f} | Rs {t['net_pnl']:+,.0f}")
-        lines.append(f"Win: {wins}/{len(trades)} | Costs: Rs {sum(t.get('costs',0) for t in trades):.0f}")
+            side = t.get("side", "LONG")
+            et = t.get("entry_time","").split(" ")[-1]
+            xt = t.get("exit_time","").split(" ")[-1]
+            if side == "SHORT":
+                lines.append(f"{e} {t['symbol']} SHORT | {et} Rs {t['entry']:,.2f} → {xt} Rs {t['exit']:,.2f} | Rs {t['net_pnl']:+,.2f}")
+            else:
+                lines.append(f"{e} {t['symbol']} LONG | {et} Rs {t['entry']:,.2f} → {xt} Rs {t['exit']:,.2f} | Rs {t['net_pnl']:+,.2f}")
+        lines.append(f"Win: {wins}/{len(trades)}")
         msg = "\n".join(lines)
         logger.info(msg)
         send_telegram(msg, config)

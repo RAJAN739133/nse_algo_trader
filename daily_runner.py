@@ -167,12 +167,14 @@ def run_daily_trading():
     score_msg = f"📊 *Stock Scores — {date.today()}*\n\n"
     for i, (_, r) in enumerate(scores.head(10).iterrows(), 1):
         star = "⭐" if r["score"] >= 60 else "  "
-        score_msg += f"{star} {r['symbol']}: *{r['score']:.0f}*/100 (RSI {r['rsi']:.0f})\n"
+        arrow = "📈" if r.get("direction","LONG")=="LONG" else "📉"
+        score_msg += f"{star} {r['symbol']}: *{r['score']:.0f}*/100 (RSI {r['rsi']:.0f}) {arrow} {r.get('direction','LONG')}\n"
 
     if len(picks) > 0:
         score_msg += f"\n✅ *TODAY'S PICKS:*\n"
         for _, p in picks.iterrows():
-            score_msg += f"  → {p['symbol']} (score {p['score']:.0f}) via {p['strategy']}\n"
+            arrow = "📈 LONG" if p.get("direction","LONG")=="LONG" else "📉 SHORT"
+            score_msg += f"  → {p['symbol']} (score {p['score']:.0f}) via {p['strategy']} {arrow}\n"
         score_msg += f"\n⏭ Skipped: {skip_count} stocks (score < 60)"
     else:
         score_msg += f"\n🛑 *NO TRADES TODAY* — no stock scored ≥ 60\nCapital protected. Sitting out."
