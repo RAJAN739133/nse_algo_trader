@@ -1,23 +1,15 @@
+# Render.com Blueprint - Free Cron Job Deployment
+# This file auto-configures the service on Render
+
 services:
-  - type: worker
+  - type: cron
     name: nse-algo-trader
-    runtime: python
-    region: singapore
-    plan: starter
+    env: python
+    schedule: "30 3 * * 1-5"  # 3:30 AM UTC = 9:00 AM IST, Mon-Fri
     buildCommand: pip install -r requirements.txt
-    startCommand: python daily_runner.py --loop
+    startCommand: python pythonanywhere_setup.py
     envVars:
-      - key: KITE_API_KEY
-        sync: false
-      - key: KITE_API_SECRET
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: TRADING_MODE
-        value: paper
+      - key: PYTHON_VERSION
+        value: "3.11"
       - key: TZ
-        value: Asia/Kolkata
+        value: "Asia/Kolkata"
