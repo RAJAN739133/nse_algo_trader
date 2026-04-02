@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-PythonAnywhere Deployment Script for NSE Algo Trader
-
-This script runs the full trading day in one execution.
-Set this as your scheduled task on PythonAnywhere.
+Cloud Deployment Script for NSE Algo Trader
+Works with: Render.com, PythonAnywhere, or any cloud platform
 
 Schedule: 09:00 AM IST (03:30 UTC)
 
-Steps to deploy:
-1. Create free account at pythonanywhere.com
-2. Go to "Consoles" → "Bash" → Run:
-   git clone https://github.com/RAJAN739133/nse_algo_trader.git
-   cd nse_algo_trader
-   pip3 install --user -r requirements.txt
+For Render.com (FREE):
+1. Create account at render.com
+2. New → Cron Job → Connect GitHub repo
+3. Schedule: 30 3 * * 1-5
+4. Build: pip install -r requirements.txt
+5. Start: python pythonanywhere_setup.py
+6. Add environment variables (see below)
 
-3. Go to "Files" → Edit config/config_prod.yaml with your API keys
-
-4. Go to "Tasks" → Add scheduled task:
-   Time: 03:30 (UTC) = 09:00 IST
-   Command: cd ~/nse_algo_trader && python3 pythonanywhere_setup.py
-
-That's it! Bot will run every trading day automatically.
+Environment Variables (set in Render dashboard):
+  ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PIN, ANGEL_TOTP_SECRET
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import os
@@ -63,28 +58,29 @@ def is_trading_day():
 def send_telegram(msg):
     """Send Telegram notification."""
     try:
-        import yaml
-        config_path = Path("config/config_prod.yaml")
-        if not config_path.exists():
-            config_path = Path("config/config_test.yaml")
-        if not config_path.exists():
-            return
-        
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-        
-        alerts = config.get("alerts", {})
-        if not alerts.get("telegram_enabled"):
-            return
-        
-        token = alerts.get("telegram_bot_token", "")
-        chat_id = alerts.get("telegram_chat_id", "")
-        
-        if not token or not chat_id:
-            return
-        
         import urllib.request
         import json
+        
+        # Try environment variables first (for Render.com)
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        
+        # Fallback to config file
+        if not token or not chat_id:
+            import yaml
+            config_path = Path("config/config_prod.yaml")
+            if not config_path.exists():
+                config_path = Path("config/config_test.yaml")
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = yaml.safe_load(f)
+                alerts = config.get("alerts", {})
+                token = token or alerts.get("telegram_bot_token", "")
+                chat_id = chat_id or alerts.get("telegram_chat_id", "")
+        
+        if not token or not chat_id:
+            logger.warning("Telegram not configured")
+            return
         
         data = json.dumps({"chat_id": chat_id, "text": msg}).encode()
         req = urllib.request.Request(
@@ -109,12 +105,63 @@ def wait_for_market_open():
         time.sleep(max(0, wait_seconds))
 
 
+def setup_credentials_from_env():
+    """Set up credentials from environment variables (for Render.com)."""
+    import yaml
+    
+    # Check if env vars are set
+    angel_api_key = os.environ.get("ANGEL_API_KEY")
+    if not angel_api_key:
+        logger.info("Using config files (no env vars found)")
+        return
+    
+    logger.info("Setting up credentials from environment variables...")
+    
+    # Create/update angel_config.yaml
+    angel_config = {
+        "angel_one": {
+            "api_key": os.environ.get("ANGEL_API_KEY", ""),
+            "client_code": os.environ.get("ANGEL_CLIENT_CODE", ""),
+            "pin": os.environ.get("ANGEL_PIN", ""),
+            "totp_secret": os.environ.get("ANGEL_TOTP_SECRET", ""),
+        }
+    }
+    
+    Path("config").mkdir(exist_ok=True)
+    with open("config/angel_config.yaml", "w") as f:
+        yaml.dump(angel_config, f)
+    
+    # Create/update config_prod.yaml if telegram vars exist
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if telegram_token:
+        config = {
+            "capital": {
+                "total": 100000,
+                "risk_per_trade": 0.01,
+                "max_trades_per_day": 5,
+                "daily_loss_limit": 0.03
+            },
+            "alerts": {
+                "telegram_enabled": True,
+                "telegram_bot_token": telegram_token,
+                "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
+            }
+        }
+        with open("config/config_prod.yaml", "w") as f:
+            yaml.dump(config, f)
+    
+    logger.info("Credentials configured from environment")
+
+
 def run_trading():
     """Run the main trading script."""
     logger.info("Starting live_paper_v3.py...")
     
+    # Setup credentials from env vars (for cloud deployment)
+    setup_credentials_from_env()
+    
     try:
-        # Import and run directly (better than subprocess on PythonAnywhere)
+        # Import and run directly
         import live_paper_v3
         
         # The main() function handles everything
@@ -146,14 +193,14 @@ def generate_report():
                 total_pnl = df["net_pnl"].sum()
                 wr = wins / total_trades * 100
                 
-                msg = f"""📊 PythonAnywhere Trading Report
+                msg = f"""📊 Cloud Trading Report
 📅 {date.today()}
 ━━━━━━━━━━━━━━━━━━━━
 📋 Trades: {total_trades}
 ✅ Wins: {wins} ({wr:.0f}%)
 💰 P&L: ₹{total_pnl:+,.0f}
 ━━━━━━━━━━━━━━━━━━━━
-🤖 Automated via PythonAnywhere"""
+🤖 Automated via Render.com"""
             else:
                 msg = f"📊 {date.today()} - No trades executed"
         else:
