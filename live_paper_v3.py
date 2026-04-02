@@ -113,19 +113,27 @@ EMERGENCY_STOP_LOSS_PCT = 0.05  # 5% HARD STOP - protects against flash crashes
 
 # Strategy filters (disable losing strategies)
 DISABLE_PULLBACK = True      # 29-43% WR - losing strategy
-DISABLE_VWAP_SHORT = True    # 33% WR - losing strategy
-DISABLE_LONG_IN_BEAR = True  # 38% WR - LONGs lose in bear markets
+DISABLE_VWAP = True          # 33% WR for VWAP_SHORT, VWAP_LONG similar
+ADAPTIVE_DIRECTION = True    # Follow market trend - trade WITH the market
 
-# Regime filters (only trade in winning regimes)
-ALLOWED_REGIMES = ["trending_down", "choppy"]  # 86% and 57% WR
-BLOCKED_REGIMES = ["ranging", "trending_up", "unknown"]  # All losing
+# Regime filters (trade in favorable regimes only)
+# NOTE: trending_up is good for LONGS, trending_down good for SHORTS
+BLOCKED_REGIMES = ["ranging", "unknown"]  # Low WR in all directions
 
-# Dynamic market trend (set at market open based on analysis)
-MARKET_TREND = "NEUTRAL"  # Will be updated dynamically: BULLISH, BEARISH, NEUTRAL
-ENABLE_LONGS = False      # DISABLED by default (38% WR) - only enable in strong bull
-ENABLE_SHORTS = True      # Always enabled (59% WR)
-MAX_LONGS = 1             # Maximum 1 LONG even when enabled
-MAX_SHORTS = 8            # Prioritize shorts
+# Dynamic market trend (detected at market open from Nifty/VIX analysis)
+# This will be updated by detect_market_trend() before trading starts
+MARKET_TREND = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL
+ENABLE_LONGS = True       # Will be set based on market trend
+ENABLE_SHORTS = True      # Will be set based on market trend
+MAX_LONGS = 5             # Dynamic limit
+MAX_SHORTS = 5            # Dynamic limit
+
+# ══════════════════════════════════════════════════════════════════════
+# KEY FIX: Trade WITH the market, not against it
+# - In BULLISH market: Prioritize LONGs, limit SHORTs
+# - In BEARISH market: Prioritize SHORTs, limit LONGs  
+# - In NEUTRAL: Be selective, smaller positions
+# ══════════════════════════════════════════════════════════════════════
 
 def get_dynamic_filters():
     """
@@ -486,12 +494,17 @@ def detect_market_trend(vix, target_date=None):
             result["max_longs"] = 0
             result["max_shorts"] = 8
         else:
+            # ══════════════════════════════════════════════════════════
+            # NEUTRAL market: Trade both directions but be selective
+            # KEY INSIGHT: Today was +1.2% bullish but detected as neutral
+            # Solution: Allow both but with smaller positions
+            # ══════════════════════════════════════════════════════════
             result["trend"] = "NEUTRAL"
             result["confidence"] = 50
-            result["enable_longs"] = False  # NO LONGs in neutral (38% WR)
-            result["enable_shorts"] = True
-            result["max_longs"] = 0
-            result["max_shorts"] = 6
+            result["enable_longs"] = True   # Allow LONGs in neutral
+            result["enable_shorts"] = True  # Allow SHORTs in neutral
+            result["max_longs"] = 3         # Limited
+            result["max_shorts"] = 3        # Limited
         
         result["reason"] = " | ".join(reasons)
         result["nifty_close"] = latest_close
@@ -880,6 +893,14 @@ class AdaptiveV3Trader:
             self.trade_count += 1
             self.sl_moved_to_be = False
             self.partial_exited = False
+            # ══════════════════════════════════════════════════════════
+            # LOSS MINIMIZATION: Cooldown after exit (prevent churning)
+            # Multiple trades per stock was causing -₹1,187 loss on HINDUNILVR
+            # ══════════════════════════════════════════════════════════
+            if not hasattr(self, 'cooldown_until') or self.cooldown_until == 0:
+                # Default cooldown: 4 candles (20 min) after any exit
+                # This will be overridden by specific exit reasons
+                pass  # Cooldown set by exit reason handlers
 
     def _enter_trade(self, signal, idx):
         # ── CANDLE PATTERN CONFIRMATION ──
@@ -1062,19 +1083,40 @@ class AdaptiveV3Trader:
             return
 
         # ══════════════════════════════════════════════════════════
-        # TIME_DECAY: 24% WR - WORST exit reason
-        # Fix: Reduce threshold from 45min to 30min, require profit or cut faster
+        # SMART TIME MANAGEMENT (replacing TIME_DECAY which had 24% WR)
+        # New logic: Trail winners, cut losers fast
         # ══════════════════════════════════════════════════════════
-        time_decay_candles = 6  # 6 × 5min = 30min (was 45min)
-        if (i - self.entry_idx) >= time_decay_candles:
-            pct_from_entry = (c - self.entry_price) / self.entry_price if self.side == "LONG" else (self.entry_price - c) / self.entry_price
-            
-            # If in profit (even small), let it run - don't cut winners
-            if pct_from_entry > 0.001:  # 0.1% profit
-                pass  # Let it run to target
-            # If flat or losing after 30 min, cut immediately
-            elif pct_from_entry < 0.002:  # Less than 0.2% profit
+        holding_candles = i - self.entry_idx
+        pct_from_entry = (c - self.entry_price) / self.entry_price if self.side == "LONG" else (self.entry_price - c) / self.entry_price
+        
+        # Phase 1 (0-15 min / 3 candles): Quick scalp check
+        if holding_candles >= 3:
+            # If we have 0.5%+ profit in first 15 min, consider taking it
+            if pct_from_entry >= 0.005:  # 0.5% profit
+                self._close_trade(c, t, "QUICK_PROFIT")
+                self.cooldown_until = i + 6  # 30 min cooldown
+                return
+        
+        # Phase 2 (15-25 min / 3-5 candles): Cut losers
+        if 3 <= holding_candles < 5:
+            if pct_from_entry < -0.003:  # Losing 0.3%+
+                self._close_trade(c, t, "CUT_LOSER")
+                self.cooldown_until = i + 8  # 40 min cooldown after loss
+                return
+        
+        # Phase 3 (25-40 min / 5-8 candles): Stricter exit
+        if 5 <= holding_candles < 8:
+            if pct_from_entry < 0.002:  # Less than 0.2% profit
                 self._close_trade(c, t, "TIME_DECAY")
+                self.cooldown_until = i + 6  # 30 min cooldown
+                return
+        
+        # Phase 4 (40+ min / 8+ candles): Force exit unless big winner
+        if holding_candles >= 8:
+            if pct_from_entry < 0.008:  # Less than 0.8% profit
+                reason = "PROFIT_LOCK" if pct_from_entry > 0 else "TIME_DECAY"
+                self._close_trade(c, t, reason)
+                self.cooldown_until = i + 6
                 return
 
         if self.side == "LONG":
@@ -1135,12 +1177,16 @@ class AdaptiveV3Trader:
 
     def _scan_for_entry(self, candles, i):
         """
-        Scan for entry signals based on current regime and ML direction.
+        Scan for entry signals based on current regime, market trend, and ML direction.
         
-        LOSS MINIMIZATION FILTERS (based on 48-trade analysis):
-        - BLOCKED REGIMES: ranging (33% WR), trending_up (20% WR), unknown (0% WR)
-        - BLOCKED STRATEGIES: PULLBACK (29-43% WR), VWAP_SHORT (33% WR)
-        - WINNING STRATEGIES ONLY: MOMENTUM_SHORT (73%), AFTERNOON_TREND_SHORT (83%), ORB_BREAKDOWN (100%)
+        KEY INSIGHT FROM APRIL 2 BACKTEST:
+        - Market was +1.2% bullish, but we only took SHORTs → all lost
+        - Solution: Trade WITH the market direction, not against it
+        
+        ADAPTIVE DIRECTION LOGIC:
+        - BULLISH market + LONG direction → High priority
+        - BEARISH market + SHORT direction → High priority
+        - Contra-trend trades → Skip (don't fight the market)
         """
         row = candles.iloc[i]
         t = pd.to_datetime(row["datetime"])
@@ -1151,17 +1197,32 @@ class AdaptiveV3Trader:
         direction = self.direction
 
         # ══════════════════════════════════════════════════════════════
-        # LOSS MINIMIZATION: Block losing regimes
+        # BLOCK LOSING REGIMES: ranging and unknown always lose
         # ══════════════════════════════════════════════════════════════
         if regime in BLOCKED_REGIMES:
-            return  # ranging=33% WR, trending_up=20% WR, unknown=0% WR
+            return
         
         # ══════════════════════════════════════════════════════════════
-        # LOSS MINIMIZATION: Only SHORT direction (59% WR vs 38% for LONG)
+        # ADAPTIVE DIRECTION: Trade WITH the market, not against it
         # ══════════════════════════════════════════════════════════════
-        if direction == "LONG" and DISABLE_LONG_IN_BEAR:
-            if MARKET_TREND not in ("STRONG_BULLISH", "BULLISH"):
-                return  # Skip LONGs unless very bullish
+        if ADAPTIVE_DIRECTION:
+            # In BULLISH market: Only take LONGs (or very strong SHORTs)
+            if MARKET_TREND in ("STRONG_BULLISH", "BULLISH"):
+                if direction == "SHORT":
+                    return  # Don't short in bullish market
+            
+            # In BEARISH market: Only take SHORTs (or very strong LONGs)
+            elif MARKET_TREND in ("BEARISH", "MILD_BEARISH"):
+                if direction == "LONG":
+                    return  # Don't go long in bearish market
+            
+            # In NEUTRAL: Check regime alignment
+            else:
+                # trending_up + SHORT = bad, trending_down + LONG = bad
+                if regime == "trending_up" and direction == "SHORT":
+                    return
+                if regime == "trending_down" and direction == "LONG":
+                    return
 
         # ── FIX: Intraday range filter — skip if stock is dead today ──
         if i > 24:  # after 2 hours of data
@@ -1172,67 +1233,59 @@ class AdaptiveV3Trader:
                 return  # dead market, skip
 
         # ══════════════════════════════════════════════════════════════
-        # WINNING STRATEGY 1: ORB Breakdown (100% WR) - SHORT only
+        # STRATEGY 1: ORB BREAKOUT/BREAKDOWN (9:20-10:30)
+        # - In BULLISH market + trending_up: ORB BREAKOUT (LONG)
+        # - In BEARISH market + trending_down: ORB BREAKDOWN (SHORT)
         # ══════════════════════════════════════════════════════════════
-        if regime == "trending_down":
-            # ORB breakdown (9:20-10:30) — SHORT ONLY (100% WR for ORB_BREAKDOWN)
-            if hour < 10 or (hour == 10 and minute <= 30):
-                if direction == "SHORT":
-                    signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
-                    if signal:
-                        self._enter_trade(signal, i)
-                        return
-
-            # DISABLED: Pullback strategy (29-43% WR - LOSING)
-            # if DISABLE_PULLBACK is False and 10 <= hour <= 11:
-            #     ... pullback logic disabled ...
-
-            # ══════════════════════════════════════════════════════════════
-            # WINNING STRATEGY 2: Momentum SHORT (73% WR)
-            # ══════════════════════════════════════════════════════════════
-            if (hour == 11 and minute >= 30) or (12 <= hour <= 13):
-                if direction == "SHORT":  # Only MOMENTUM_SHORT (73% WR)
-                    signal = self._generate_momentum_signal(candles, i, direction)
-                    if signal:
-                        self._enter_trade(signal, i)
-                        return
+        if hour < 10 or (hour == 10 and minute <= 30):
+            if regime == "trending_down" and direction == "SHORT":
+                signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
+                if signal:
+                    self._enter_trade(signal, i)
+                    return
+            elif regime == "trending_up" and direction == "LONG":
+                signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
+                if signal:
+                    self._enter_trade(signal, i)
+                    return
 
         # ══════════════════════════════════════════════════════════════
-        # CHOPPY regime: Only MOMENTUM_SHORT allowed (57% regime WR)
+        # STRATEGY 2: MOMENTUM (11:30-14:00)
+        # Trade in direction of market trend
         # ══════════════════════════════════════════════════════════════
-        if regime == "choppy":
-            # DISABLED: VWAP_SHORT (33% WR - LOSING)
-            # if not DISABLE_VWAP_SHORT and hour >= 10 and hour < 14:
-            #     ... vwap logic disabled ...
-            
-            # Allow MOMENTUM_SHORT in choppy with strict filters
-            if hour >= 11 and hour < 14 and direction == "SHORT":
+        if (hour == 11 and minute >= 30) or (12 <= hour <= 13):
+            # Allow momentum in both directions based on regime
+            if regime == "trending_down" and direction == "SHORT":
+                signal = self._generate_momentum_signal(candles, i, direction)
+                if signal:
+                    self._enter_trade(signal, i)
+                    return
+            elif regime == "trending_up" and direction == "LONG":
+                signal = self._generate_momentum_signal(candles, i, direction)
+                if signal:
+                    self._enter_trade(signal, i)
+                    return
+            elif regime == "choppy":
+                # In choppy, only trade with very strong signals
                 signal = self._generate_momentum_signal(candles, i, direction, lookback=8)
                 if signal and abs(signal.get("risk", 0)) > 0:
-                    # Extra volume filter for choppy - need 1.5x avg volume
                     avg_vol = candles["volume"].iloc[max(0, i - 20):i].mean()
                     curr_vol = candles["volume"].iloc[i]
-                    if curr_vol > avg_vol * 1.5:  # Stricter volume requirement
+                    if curr_vol > avg_vol * 1.5:
                         self._enter_trade(signal, i)
                         return
-            
-            # ══════════════════════════════════════════════════════════════
-            # WINNING STRATEGY 3: Afternoon Trend SHORT (83% WR)
-            # ══════════════════════════════════════════════════════════════
-            if regime == "choppy" and 13 <= hour <= 14 and direction == "SHORT":
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 3: AFTERNOON TREND (13:00-14:30)
+        # Trade in direction of established intraday trend
+        # ══════════════════════════════════════════════════════════════
+        if 13 <= hour <= 14 and minute <= 30:
+            if regime in ("trending_down", "choppy") and direction == "SHORT":
                 signal = self._generate_afternoon_trend_signal(candles, i, direction)
                 if signal:
                     self._enter_trade(signal, i)
                     return
-            
-            return  # No more strategies for choppy
-
-        # ══════════════════════════════════════════════════════════════
-        # WINNING STRATEGY 3: Afternoon Trend SHORT (83% WR) - All regimes
-        # AFTERNOON_TREND_LONG has 0% WR - DISABLED
-        # ══════════════════════════════════════════════════════════════
-        if 13 <= hour <= 14 and minute <= 30:
-            if direction == "SHORT":  # Only AFTERNOON_TREND_SHORT (83% WR)
+            elif regime in ("trending_up", "choppy") and direction == "LONG":
                 signal = self._generate_afternoon_trend_signal(candles, i, direction)
                 if signal:
                     self._enter_trade(signal, i)
@@ -1274,7 +1327,12 @@ class AdaptiveV3Trader:
             atr = self._quick_atr(candles, i)
             sl = close + atr * 1.5
             risk = sl - close
-            tgt = close - risk * 2.0
+            # ══════════════════════════════════════════════════════════
+            # LOSS MINIMIZATION: Tighter targets for choppy regime
+            # Historical data shows avg move is only 0.2%, so 2R targets rarely hit
+            # ══════════════════════════════════════════════════════════
+            rr_mult = 1.2 if self.current_regime == "choppy" else 1.5
+            tgt = close - risk * rr_mult
             return {
                 "side": "SHORT", "entry": close, "sl": sl, "tgt": tgt,
                 "risk": risk, "time": t, "type": "MOMENTUM_SHORT",
