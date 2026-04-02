@@ -86,7 +86,8 @@ except ImportError:
 
 # Production-proven parameters from backtest
 MIN_ML_CONFIDENCE = 0.12  # Minimum abs(prob - 0.5) threshold
-DISABLE_STOP_LOSSES = True  # Stop losses were 100% losers in backtest
+DISABLE_STOP_LOSSES = True  # Regular stop losses were 100% losers in backtest
+EMERGENCY_STOP_LOSS_PCT = 0.05  # 5% HARD STOP - protects against flash crashes
 
 # Dynamic market trend (set at market open based on analysis)
 MARKET_TREND = "NEUTRAL"  # Will be updated dynamically: BULLISH, BEARISH, NEUTRAL
@@ -188,7 +189,8 @@ def is_market_open_today():
         if now.hour < 9 or (now.hour == 9 and now.minute < 20):
             return True, "Pre-market (assuming open)"
         return False, "No market data — probable holiday"
-    except:
+    except Exception as e:
+        logger.warning(f"  Market open check failed: {e} — assuming open")
         return True, "API check failed, assuming open"
 
 
@@ -304,9 +306,10 @@ def fetch_vix(target_date=None):
             data = yf.Ticker("^INDIAVIX").history(period="5d")
             if len(data) > 0:
                 return round(float(data.iloc[-1]["Close"]), 2)
-    except:
-        pass
-    return 15.0
+    except Exception as e:
+        logger.warning(f"  VIX fetch failed: {e} — using conservative default 20.0")
+        return 20.0  # Conservative default on error (higher = more cautious)
+    return 15.0  # Normal default when no data
 
 
 def detect_market_trend(vix, target_date=None):
@@ -517,15 +520,35 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
     mp_v1 = Path("models/stock_predictor.pkl")
     
     if mp_v2.exists():
-        with open(mp_v2, "rb") as f:
-            d = pickle.load(f)
-        model, feats = d["model"], d["features"]
-        logger.info(f"  Using V2 model (trained on {d.get('trained_on', '?')} samples)")
+        try:
+            with open(mp_v2, "rb") as f:
+                d = pickle.load(f)
+            model, feats = d["model"], d["features"]
+            
+            # Validate model has required method
+            if not hasattr(model, "predict_proba"):
+                logger.error("  V2 model doesn't support predict_proba — using scoring without ML")
+                model, feats = None, None
+            else:
+                # Check model age
+                train_date = d.get("train_date", d.get("trained_on", "unknown"))
+                logger.info(f"  Using V2 model (trained: {train_date}, {d.get('trained_on', '?')} samples)")
+        except Exception as e:
+            logger.error(f"  Failed to load V2 model: {e}")
+            model, feats = None, None
     elif mp_v1.exists():
-        with open(mp_v1, "rb") as f:
-            d = pickle.load(f)
-        model, feats = d["model"], d["features"]
-        logger.info("  Using V1 model (consider training V2 for better results)")
+        try:
+            with open(mp_v1, "rb") as f:
+                d = pickle.load(f)
+            model, feats = d["model"], d["features"]
+            if not hasattr(model, "predict_proba"):
+                logger.error("  V1 model doesn't support predict_proba")
+                model, feats = None, None
+            else:
+                logger.info("  Using V1 model (consider training V2 for better results)")
+        except Exception as e:
+            logger.error(f"  Failed to load V1 model: {e}")
+            model, feats = None, None
 
     # Use V2 scoring if available
     if USE_V2_MODEL:
@@ -990,6 +1013,22 @@ class AdaptiveV3Trader:
         t = pd.to_datetime(row["datetime"])
         h, l, c = row["high"], row["low"], row["close"]
 
+        # ══════════════════════════════════════════════════════════
+        # EMERGENCY STOP LOSS — Hard 5% limit to protect against flash crashes
+        # This runs regardless of DISABLE_STOP_LOSSES setting
+        # ══════════════════════════════════════════════════════════
+        loss_pct = 0
+        if self.side == "LONG":
+            loss_pct = (self.entry_price - c) / self.entry_price if c < self.entry_price else 0
+        else:  # SHORT
+            loss_pct = (c - self.entry_price) / self.entry_price if c > self.entry_price else 0
+        
+        if loss_pct >= EMERGENCY_STOP_LOSS_PCT:
+            logger.warning(f"  ⚠️ {self.symbol} EMERGENCY STOP triggered at {loss_pct*100:.1f}% loss!")
+            self._close_trade(c, t, f"EMERGENCY_STOP_{loss_pct*100:.0f}%")
+            self.cooldown_until = i + 12  # 1 hour cooldown after emergency stop
+            return
+
         # Time-decay: cut flat trades after ~45 min (was 90 — held too long, paid costs)
         time_decay_candles = 9  # 9 × 5min = 45min
         if (i - self.entry_idx) >= time_decay_candles:
@@ -1334,19 +1373,7 @@ def run(symbols=None, backtest_date=None):
     logger.info(f"\n{trend_msg}")
     send_telegram(trend_msg, config)
 
-    # ── Initialize Angel One broker (if configured) ──
-    broker = None
-    if not is_backtest and config.get("broker", {}).get("angel_one", {}).get("api_key"):
-        try:
-            from data.angel_broker import AngelBroker
-            broker = AngelBroker(config)
-            if broker.connect():
-                logger.info(f"  🔗 Angel One connected | Mode: {broker.mode.upper()}")
-            else:
-                broker = None
-        except Exception as e:
-            logger.warning(f"  Angel One init error: {e}")
-            broker = None
+    # ── VIX extreme check ──
     vix_limit = config.get("filters", {}).get("vix_extreme_threshold", 40)
     if vix > vix_limit:
         msg = f"⚠️ VIX {vix} > {vix_limit} — EXTREME. Sitting out."

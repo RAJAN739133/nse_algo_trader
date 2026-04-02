@@ -39,14 +39,39 @@ SAFETY_LIMITS = {
 
 # Cache to avoid repeated identical calls
 _response_cache = {}
-_api_call_count = 0
+_API_COUNT_FILE = Path("data/.claude_api_count.json")
+
+
+def _get_api_call_count() -> int:
+    """Get today's API call count from persistent storage."""
+    try:
+        if _API_COUNT_FILE.exists():
+            data = json.loads(_API_COUNT_FILE.read_text())
+            if data.get("date") == str(date.today()):
+                return data.get("count", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _increment_api_call_count():
+    """Increment and persist today's API call count."""
+    try:
+        _API_COUNT_FILE.parent.mkdir(exist_ok=True)
+        current = _get_api_call_count()
+        _API_COUNT_FILE.write_text(json.dumps({
+            "date": str(date.today()),
+            "count": current + 1
+        }))
+    except Exception as e:
+        logger.debug(f"Failed to persist API count: {e}")
 
 
 def _call_claude(api_key, system_prompt, user_prompt, max_tokens=800):
     """Raw Claude API call with caching and rate limiting."""
-    global _api_call_count
-    if _api_call_count >= SAFETY_LIMITS["max_api_calls_per_day"]:
-        logger.warning("Claude API daily limit reached")
+    api_count = _get_api_call_count()
+    if api_count >= SAFETY_LIMITS["max_api_calls_per_day"]:
+        logger.warning(f"Claude API daily limit reached ({api_count}/{SAFETY_LIMITS['max_api_calls_per_day']})")
         return None
 
     # Simple cache by prompt hash
@@ -71,7 +96,7 @@ def _call_claude(api_key, system_prompt, user_prompt, max_tokens=800):
             },
             timeout=30,
         )
-        _api_call_count += 1
+        _increment_api_call_count()
         data = resp.json()
         if "error" in data:
             logger.warning(f"Claude API error: {data['error'].get('message', '')}")
@@ -742,4 +767,4 @@ Return JSON:
         }
 
     def get_api_usage(self):
-        return {"calls_today": _api_call_count, "limit": SAFETY_LIMITS["max_api_calls_per_day"]}
+        return {"calls_today": _get_api_call_count(), "limit": SAFETY_LIMITS["max_api_calls_per_day"]}

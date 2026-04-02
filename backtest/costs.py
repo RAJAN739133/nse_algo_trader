@@ -53,12 +53,14 @@ class AngelOneCostModel:
             buy_value: Total value of buy order (price × shares)
             sell_value: Total value of sell order (price × shares)
         """
+        # Validate inputs
+        if buy_value <= 0 or sell_value <= 0:
+            raise ValueError(f"Invalid trade values: buy={buy_value}, sell={sell_value}")
+        
         turnover = buy_value + sell_value
 
-        # Brokerage: ₹20 per order or 0.03%, whichever is lower
-        brok_buy = min(self.BROKERAGE_FLAT, buy_value * self.BROKERAGE_PCT)
-        brok_sell = min(self.BROKERAGE_FLAT, sell_value * self.BROKERAGE_PCT)
-        brokerage = brok_buy + brok_sell
+        # Brokerage: Angel One charges flat ₹20 per order (not percentage-based)
+        brokerage = self.BROKERAGE_FLAT * 2  # ₹20 buy + ₹20 sell = ₹40 round trip
 
         # STT: only on sell side for intraday
         stt = sell_value * self.STT_RATE
