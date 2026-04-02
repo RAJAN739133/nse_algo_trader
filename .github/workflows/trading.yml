@@ -79,6 +79,9 @@ jobs:
             telegram_enabled: true
             telegram_bot_token: "${{ secrets.TELEGRAM_BOT_TOKEN }}"
             telegram_chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          claude:
+            enabled: true
+            api_key: "${{ secrets.ANTHROPIC_API_KEY }}"
           EOF
       
       - name: Send start notification
