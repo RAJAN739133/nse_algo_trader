@@ -524,6 +524,129 @@ def detect_market_trend(vix, target_date=None):
 
 
 # ════════════════════════════════════════════════════════════
+# SECTOR ROTATION DETECTION
+# ════════════════════════════════════════════════════════════
+
+# Global sector data (updated at market open)
+SECTOR_PERFORMANCE = {}
+TOP_SECTORS = []
+WEAK_SECTORS = []
+VIX_LEVEL = 15.0  # Default, updated at open
+
+def detect_sector_rotation():
+    """
+    Analyze sector performance to identify leading/lagging sectors.
+    Run this at 9:30 AM after first 15 min of trading.
+    
+    Returns dict with sector rankings and recommended stocks per sector.
+    """
+    global SECTOR_PERFORMANCE, TOP_SECTORS, WEAK_SECTORS, VIX_LEVEL
+    
+    import yfinance as yf
+    
+    sectors = {
+        'IT': ['TCS', 'INFY', 'WIPRO', 'HCLTECH', 'TECHM'],
+        'Banking': ['HDFCBANK', 'ICICIBANK', 'SBIN', 'KOTAKBANK', 'AXISBANK'],
+        'Pharma': ['SUNPHARMA', 'DRREDDY', 'CIPLA', 'DIVISLAB', 'LUPIN'],
+        'Auto': ['MARUTI', 'M&M', 'BAJAJ-AUTO', 'EICHERMOT', 'TVSMOTOR'],
+        'Metal': ['TATASTEEL', 'JSWSTEEL', 'HINDALCO', 'VEDL', 'JINDALSTEL'],
+        'FMCG': ['HINDUNILVR', 'ITC', 'NESTLEIND', 'BRITANNIA', 'DABUR'],
+        'Finance': ['BAJFINANCE', 'BAJAJFINSV', 'CHOLAFIN', 'MUTHOOTFIN', 'PFC'],
+        'Energy': ['RELIANCE', 'ONGC', 'BPCL', 'IOC', 'GAIL']
+    }
+    
+    result = {"sectors": {}, "top_sectors": [], "weak_sectors": [], "vix": 15.0}
+    
+    try:
+        # Get VIX
+        try:
+            vix_data = yf.Ticker("^INDIAVIX").history(period="2d")
+            if len(vix_data) > 0:
+                VIX_LEVEL = float(vix_data["Close"].iloc[-1])
+                result["vix"] = VIX_LEVEL
+                logger.info(f"  VIX Level: {VIX_LEVEL:.2f}")
+        except:
+            VIX_LEVEL = 15.0
+        
+        # Calculate sector performance
+        sector_changes = {}
+        
+        for sector, stocks in sectors.items():
+            changes = []
+            for sym in stocks[:3]:  # Top 3 per sector for speed
+                try:
+                    df = yf.download(f"{sym}.NS", period="2d", interval="1d", progress=False)
+                    if len(df) >= 2:
+                        df = df.reset_index()
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = [col[0].lower() for col in df.columns]
+                        change = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2] * 100
+                        changes.append(change)
+                except:
+                    pass
+            
+            if changes:
+                avg_change = np.mean(changes)
+                sector_changes[sector] = avg_change
+                result["sectors"][sector] = {
+                    "change": avg_change,
+                    "stocks": stocks,
+                    "status": "STRONG" if avg_change > 0.5 else ("WEAK" if avg_change < -0.5 else "NEUTRAL")
+                }
+        
+        # Sort sectors by performance
+        sorted_sectors = sorted(sector_changes.items(), key=lambda x: x[1], reverse=True)
+        
+        # Top 2 sectors (LONG candidates)
+        TOP_SECTORS = [s[0] for s in sorted_sectors[:2]]
+        result["top_sectors"] = TOP_SECTORS
+        
+        # Bottom 2 sectors (SHORT candidates or avoid)
+        WEAK_SECTORS = [s[0] for s in sorted_sectors[-2:]]
+        result["weak_sectors"] = WEAK_SECTORS
+        
+        SECTOR_PERFORMANCE = sector_changes
+        
+        logger.info(f"  Top Sectors: {TOP_SECTORS}")
+        logger.info(f"  Weak Sectors: {WEAK_SECTORS}")
+        
+    except Exception as e:
+        logger.warning(f"  Sector rotation detection error: {e}")
+    
+    return result
+
+
+def get_vix_adjusted_params():
+    """
+    Return target and stop percentages based on VIX level.
+    Higher VIX = wider targets and stops.
+    """
+    global VIX_LEVEL
+    
+    if VIX_LEVEL < 15:
+        return {"target_pct": 0.012, "stop_pct": 0.008, "label": "LOW_VIX"}
+    elif VIX_LEVEL < 20:
+        return {"target_pct": 0.015, "stop_pct": 0.010, "label": "NORMAL_VIX"}
+    elif VIX_LEVEL < 25:
+        return {"target_pct": 0.018, "stop_pct": 0.012, "label": "ELEVATED_VIX"}
+    else:
+        return {"target_pct": 0.020, "stop_pct": 0.015, "label": "HIGH_VIX"}
+
+
+def is_stock_in_strong_sector(symbol):
+    """Check if a stock is in a top-performing sector."""
+    global TOP_SECTORS, WEAK_SECTORS
+    
+    sector = STOCK_SECTORS.get(symbol, "Unknown")
+    
+    if sector in TOP_SECTORS:
+        return 1  # Strong sector bonus
+    elif sector in WEAK_SECTORS:
+        return -1  # Weak sector penalty
+    return 0  # Neutral
+
+
+# ════════════════════════════════════════════════════════════
 # DYNAMIC STOCK SELECTION — no hardcoded list
 # ════════════════════════════════════════════════════════════
 
@@ -1203,6 +1326,16 @@ class AdaptiveV3Trader:
             return
         
         # ══════════════════════════════════════════════════════════════
+        # SECTOR ROTATION FILTER (April 2 insight: IT +1.89%, Pharma -0.56%)
+        # ══════════════════════════════════════════════════════════════
+        sector_score = is_stock_in_strong_sector(self.symbol)
+        
+        if direction == "LONG" and sector_score < 0:
+            return  # Don't go long in weak sector
+        if direction == "SHORT" and sector_score > 0:
+            return  # Don't short in strong sector
+        
+        # ══════════════════════════════════════════════════════════════
         # ADAPTIVE DIRECTION: Trade WITH the market, not against it
         # ══════════════════════════════════════════════════════════════
         if ADAPTIVE_DIRECTION:
@@ -1310,33 +1443,36 @@ class AdaptiveV3Trader:
         if not vol_ok:
             return None
 
+        # ══════════════════════════════════════════════════════════
+        # VIX-ADJUSTED TARGETS (April 2 insight: VIX 25.52 = 2% targets)
+        # ══════════════════════════════════════════════════════════
+        vix_params = get_vix_adjusted_params()
+        target_pct = vix_params["target_pct"]
+        
         # MUST align with ML direction
-        # V2: Reduced threshold from 0.6% to 0.5% to catch more trades
         if direction == "LONG" and price_change > 0.005:
             atr = self._quick_atr(candles, i)
             sl = close - atr * 1.5
             risk = close - sl
-            tgt = close + risk * 2.0
+            # VIX-adjusted target
+            tgt = close * (1 + target_pct)
             return {
                 "side": "LONG", "entry": close, "sl": sl, "tgt": tgt,
                 "risk": risk, "time": t, "type": "MOMENTUM_LONG",
-                "reason": f"Momentum +{price_change*100:.1f}% with vol, regime={self.current_regime}",
+                "reason": f"Momentum +{price_change*100:.1f}% with vol, VIX={VIX_LEVEL:.0f}",
                 "candles": candles  # Pass candles for pattern check
             }
         elif direction == "SHORT" and price_change < -0.005:
             atr = self._quick_atr(candles, i)
             sl = close + atr * 1.5
             risk = sl - close
-            # ══════════════════════════════════════════════════════════
-            # LOSS MINIMIZATION: Tighter targets for choppy regime
-            # Historical data shows avg move is only 0.2%, so 2R targets rarely hit
-            # ══════════════════════════════════════════════════════════
-            rr_mult = 1.2 if self.current_regime == "choppy" else 1.5
-            tgt = close - risk * rr_mult
+            # VIX-adjusted target (tighter in choppy)
+            adj_target = target_pct * 0.8 if self.current_regime == "choppy" else target_pct
+            tgt = close * (1 - adj_target)
             return {
                 "side": "SHORT", "entry": close, "sl": sl, "tgt": tgt,
                 "risk": risk, "time": t, "type": "MOMENTUM_SHORT",
-                "reason": f"Momentum {price_change*100:.1f}% with vol, regime={self.current_regime}"
+                "reason": f"Momentum {price_change*100:.1f}% with vol, VIX={VIX_LEVEL:.0f}"
             }
         return None
 
