@@ -102,7 +102,7 @@ jobs:
           
           print(f"🚀 Starting trading for {today}")
           result = subprocess.run(
-            ["python", "live_paper_v3.py", "--universe", "nifty50", "--top", "10"],
+            ["python", "live_paper_v3.py", "--universe", "nifty250", "--top", "20"],
             capture_output=False
           )
           sys.exit(result.returncode)
