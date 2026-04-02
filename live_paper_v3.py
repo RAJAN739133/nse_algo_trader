@@ -960,16 +960,16 @@ class AdaptiveV3Trader:
     V3 trader: adaptive strategy based on regime detection.
     
     Features:
-    - Respects ML direction (LONG/SHORT bias)
-    - Candlestick pattern confirmation
+    - Uses REAL-TIME market bias (not ML prediction)
+    - Direction from price position in day's range
     - Dynamic stop loss management
     - Regime-based strategy switching
     """
 
     def __init__(self, symbol, direction, config, ml_score=50):
         self.symbol = symbol
-        self.direction = direction
-        self.ml_score = ml_score
+        self.direction = direction  # Now overridden by real-time bias in _scan_for_entry
+        self.ml_score = ml_score  # Used for stock SELECTION only, not direction
         self.capital = config["capital"]["total"]
         self.config = config
         self.cost_model = AngelOneCostModel()
@@ -1351,16 +1351,18 @@ class AdaptiveV3Trader:
 
     def _scan_for_entry(self, candles, i):
         """
-        Scan for entry signals based on current regime, market trend, and ML direction.
+        Scan for entry signals using PURE PRICE ACTION (no ML for direction).
         
-        KEY INSIGHT FROM APRIL 2 BACKTEST:
-        - Market was +1.2% bullish, but we only took SHORTs → all lost
-        - Solution: Trade WITH the market direction, not against it
+        KEY INSIGHT FROM APRIL 2:
+        - ML predicted SHORT at 9:45 AM (market down -0.89%)
+        - Market reversed to +1.42% by close
+        - ML direction was WRONG all day
         
-        ADAPTIVE DIRECTION LOGIC:
-        - BULLISH market + LONG direction → High priority
-        - BEARISH market + SHORT direction → High priority
-        - Contra-trend trades → Skip (don't fight the market)
+        CORRECT APPROACH (Pure Price Action):
+        - Direction = WHERE price IS in day's range (not ML prediction)
+        - Upper 55% of range → LONG bias
+        - Lower 45% of range → SHORT bias
+        - This adapts EVERY CANDLE to reversals!
         """
         row = candles.iloc[i]
         t = pd.to_datetime(row["datetime"])
@@ -1368,13 +1370,46 @@ class AdaptiveV3Trader:
         hour, minute = t.hour, t.minute
 
         regime = self.current_regime
-        direction = self.direction
 
         # ══════════════════════════════════════════════════════════════
         # BLOCK LOSING REGIMES: ranging and unknown always lose
         # ══════════════════════════════════════════════════════════════
         if regime in BLOCKED_REGIMES:
             return
+        
+        # ══════════════════════════════════════════════════════════════
+        # DON'T TRADE FIRST HOUR (let market establish range)
+        # ══════════════════════════════════════════════════════════════
+        if hour < 5:  # Before ~10:15 AM IST (UTC+5:30)
+            return
+        
+        # ══════════════════════════════════════════════════════════════
+        # PURE PRICE ACTION: Get direction from CURRENT price position
+        # This is the KEY fix - NO ML direction, only real-time bias!
+        # ══════════════════════════════════════════════════════════════
+        realtime_bias = 0
+        direction = "NEUTRAL"
+        
+        try:
+            import yfinance as yf
+            nifty = yf.Ticker("^NSEI").history(period="1d", interval="5m")
+            if len(nifty) > 0:
+                nifty = nifty.reset_index()
+                nifty.columns = [c.lower() for c in nifty.columns]
+                realtime_bias, bias_conf = get_realtime_market_bias(nifty, len(nifty)-1)
+                
+                if realtime_bias == 1:
+                    direction = "LONG"
+                elif realtime_bias == -1:
+                    direction = "SHORT"
+                else:
+                    return  # NEUTRAL = don't trade
+                    
+                # Need minimum confidence to trade
+                if bias_conf < 55:
+                    return
+        except:
+            return  # If can't get real-time data, don't trade (no guessing)
         
         # ══════════════════════════════════════════════════════════════
         # SECTOR ROTATION FILTER (April 2 insight: IT +1.89%, Pharma -0.56%)
@@ -1385,48 +1420,6 @@ class AdaptiveV3Trader:
             return  # Don't go long in weak sector
         if direction == "SHORT" and sector_score > 0:
             return  # Don't short in strong sector
-        
-        # ══════════════════════════════════════════════════════════════
-        # PROPER ALGO: Real-time market bias (position in range)
-        # This catches V-reversals that static trend detection misses
-        # ══════════════════════════════════════════════════════════════
-        
-        # Don't trade in first hour (fake moves, let market establish)
-        if hour < 5:  # Before ~10:15 AM IST (UTC+5:30)
-            return
-        
-        # Get real-time bias from Nifty position in day's range
-        # This is the KEY insight that turned -Rs 5,575 into +Rs 157,298
-        try:
-            import yfinance as yf
-            nifty = yf.Ticker("^NSEI").history(period="1d", interval="5m")
-            if len(nifty) > 0:
-                nifty = nifty.reset_index()
-                nifty.columns = [c.lower() for c in nifty.columns]
-                realtime_bias, bias_conf = get_realtime_market_bias(nifty, len(nifty)-1)
-                
-                # Override ML direction with real-time bias if strong
-                if bias_conf > 60:
-                    if realtime_bias == 1 and direction == "SHORT":
-                        return  # Market recovering, don't short
-                    elif realtime_bias == -1 and direction == "LONG":
-                        return  # Market falling, don't go long
-        except:
-            pass  # If Nifty fetch fails, use existing logic
-        
-        # Fallback to static trend if real-time not available
-        if ADAPTIVE_DIRECTION:
-            if MARKET_TREND in ("STRONG_BULLISH", "BULLISH"):
-                if direction == "SHORT":
-                    return
-            elif MARKET_TREND in ("BEARISH", "MILD_BEARISH"):
-                if direction == "LONG":
-                    return
-            else:
-                if regime == "trending_up" and direction == "SHORT":
-                    return
-                if regime == "trending_down" and direction == "LONG":
-                    return
 
         # ── FIX: Intraday range filter — skip if stock is dead today ──
         if i > 24:  # after 2 hours of data
@@ -1496,7 +1489,7 @@ class AdaptiveV3Trader:
                     return
 
     def _generate_momentum_signal(self, candles, i, direction, lookback=8):
-        """Momentum continuation in ML direction only."""
+        """Momentum continuation in real-time market direction."""
         if i < lookback + 3:
             return None
         row = candles.iloc[i]
@@ -1520,7 +1513,7 @@ class AdaptiveV3Trader:
         vix_params = get_vix_adjusted_params()
         target_pct = vix_params["target_pct"]
         
-        # MUST align with ML direction
+        # MUST align with real-time market direction
         if direction == "LONG" and price_change > 0.005:
             atr = self._quick_atr(candles, i)
             sl = close - atr * 1.5
@@ -1548,7 +1541,7 @@ class AdaptiveV3Trader:
         return None
 
     def _generate_vwap_direction_signal(self, candles, i, direction):
-        """VWAP mean-reversion but only in ML direction."""
+        """VWAP mean-reversion in real-time market direction."""
         row = candles.iloc[i]
         close = row["close"]
         t = pd.to_datetime(row["datetime"])
@@ -1564,7 +1557,7 @@ class AdaptiveV3Trader:
         rsi = self.strategy.compute_rsi(candles["close"].iloc[:i + 1], period=14)
         deviation = (close - vwap) / std
 
-        # LONG only when ML says LONG and price is below VWAP
+        # LONG only when market bias is LONG and price is below VWAP
         if direction == "LONG" and deviation < -1.5 and rsi < 35:
             sl = close - std * 1.5
             risk = close - sl
@@ -1573,10 +1566,10 @@ class AdaptiveV3Trader:
             return {
                 "side": "LONG", "entry": close, "sl": sl, "tgt": vwap,
                 "risk": risk, "time": t, "type": "VWAP_LONG",
-                "reason": f"VWAP oversold {deviation:.1f}σ RSI={rsi:.0f}, ML=LONG"
+                "reason": f"VWAP oversold {deviation:.1f}σ RSI={rsi:.0f}, bias=LONG"
             }
 
-        # SHORT only when ML says SHORT and price is above VWAP
+        # SHORT only when market bias is SHORT and price is above VWAP
         if direction == "SHORT" and deviation > 1.5 and rsi > 65:
             sl = close + std * 1.5
             risk = sl - close
@@ -1585,12 +1578,12 @@ class AdaptiveV3Trader:
             return {
                 "side": "SHORT", "entry": close, "sl": sl, "tgt": vwap,
                 "risk": risk, "time": t, "type": "VWAP_SHORT",
-                "reason": f"VWAP overbought +{deviation:.1f}σ RSI={rsi:.0f}, ML=SHORT"
+                "reason": f"VWAP overbought +{deviation:.1f}σ RSI={rsi:.0f}, bias=SHORT"
             }
         return None
 
     def _generate_afternoon_trend_signal(self, candles, i, direction):
-        """Afternoon entry — only strong signals in ML direction with volume."""
+        """Afternoon entry — strong signals in real-time market direction."""
         if i < 30:
             return None
         row = candles.iloc[i]
