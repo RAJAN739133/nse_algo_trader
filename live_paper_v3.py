@@ -1325,9 +1325,9 @@ class AdaptiveV3Trader:
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
             
-            # Stage 2: Trail stop 0.3% behind price after 0.7% profit
+            # Stage 2: Trail stop 0.2% behind price after 0.7% profit (tighter)
             if unrealised_pct >= 0.007:
-                new_sl = c * 0.997  # 0.3% below current price
+                new_sl = c * 0.998  # 0.2% below current price (tighter than 0.3%)
                 if new_sl > self.sl:
                     self.sl = new_sl
                     logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
@@ -1362,9 +1362,9 @@ class AdaptiveV3Trader:
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
             
-            # Stage 2: Trail stop 0.3% above price after 0.7% profit
+            # Stage 2: Trail stop 0.2% above price after 0.7% profit (tighter)
             if unrealised_pct >= 0.007:
-                new_sl = c * 1.003  # 0.3% above current price
+                new_sl = c * 1.002  # 0.2% above current price (tighter than 0.3%)
                 if new_sl < self.sl:
                     self.sl = new_sl
                     logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
