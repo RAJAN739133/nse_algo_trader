@@ -1,7 +1,16 @@
 # NSE Intraday Algo Trader
 
 Automated intraday trading bot for NSE India — ML stock selection, 5 adaptive strategies,
-Claude AI brain, Angel One real-time data, regime detection, and Telegram alerts.
+Claude AI brain, Angel One real-time data, **dynamic market trend detection**, regime detection, and Telegram alerts.
+
+## Key Features (V3)
+
+- **Dynamic Market Trend Detection** — Analyzes Nifty 50, VIX, SMAs at market open to determine BULLISH/BEARISH/NEUTRAL bias
+- **Adaptive LONG/SHORT Trading** — Automatically adjusts trade direction limits based on market trend
+- **Angel One Integration** — Real-time 5-min candles via SmartAPI (no Zerodha dependency)
+- **ML Confidence Filter** — Only takes trades with 12%+ model confidence
+- **Enhanced Telegram Alerts** — Trade entry/exit with timestamps, P&L, holding time, EOD summary with reasons
+- **Regime Detection** — Per-stock regime (trending/ranging/volatile/choppy) with strategy adaptation
 
 ## Architecture
 
@@ -12,10 +21,14 @@ Claude AI brain, Angel One real-time data, regime detection, and Telegram alerts
 │Claude V2 │ ML Model │News Scan │ VIX Check│ Angel One Login │
 │morning   │ scoring  │ RSS feed │ yfinance │ SmartAPI TOTP   │
 ├──────────┴──────────┴──────────┴──────────┴─────────────────┤
-│              STOCK SELECTION (Top 8 from Nifty 50)           │
-│  ML score + Delivery% + ATR fitness + Sector diversification │
+│         DYNAMIC MARKET TREND DETECTION (9:05 AM)            │
+│  Nifty momentum + VIX + Gap + SMAs → BULLISH/BEARISH/NEUTRAL│
 ├─────────────────────────────────────────────────────────────┤
-│              REGIME DETECTOR (per stock, per hour)            │
+│              STOCK SELECTION (Top 8-10 from Nifty 100)      │
+│  ML score + Delivery% + ATR fitness + Sector diversification │
+│  Direction limits: BULLISH → 8L/2S | BEARISH → 2L/8S        │
+├─────────────────────────────────────────────────────────────┤
+│              REGIME DETECTOR (per stock, per hour)           │
 │  trending_up │ trending_down │ ranging │ volatile │ choppy   │
 ├──────┬───────┬────────┬──────┬──────────────────────────────┤
 │ ORB  │Pullbk │Momentum│ VWAP │ Afternoon Trend              │
@@ -44,15 +57,89 @@ pip install -r requirements.txt
 # 2. Test APIs
 python test_apis.py                        # Check Claude + Angel One
 
-# 3. Run backtest on any date
-python live_paper_v3.py --backtest 2026-04-01
-
-# 4. Start live paper trading (market hours)
+# 3. Run live paper trading (market hours)
 python live_paper_v3.py
 
-# 5. Full automated day (scheduler)
+# 4. Full automated day (scheduler)
 python scheduler.py install                # Install cron
 python scheduler.py run-now                # Start trading NOW
+```
+
+## Dynamic Market Trend Detection
+
+At market open (9:05 AM), the system analyzes:
+
+| Factor | Weight | Logic |
+|--------|--------|-------|
+| Weekly Momentum | ±30 pts | Nifty 50 5-day change (>2% strong, >0.5% mild) |
+| Daily Gap | ±20 pts | Gap up/down from previous close |
+| Price vs SMAs | ±20 pts | Above/below 5-day and 10-day SMAs |
+| VIX Level | ±30 pts | High VIX (>25) = fear, Low VIX (<13) = complacent |
+
+**Trend Classification:**
+| Score | Trend | Max LONGS | Max SHORTS |
+|-------|-------|-----------|------------|
+| ≥30 | BULLISH | 8 | 2 |
+| 10-29 | MILD_BULLISH | 6 | 3 |
+| -9 to +9 | NEUTRAL | 5 | 5 |
+| -10 to -29 | MILD_BEARISH | 3 | 6 |
+| ≤-30 | BEARISH | 2 | 8 |
+
+Example Telegram alert at market open:
+```
+📊 MARKET TREND: BEARISH (90% confidence)
+  LONGS: ENABLED (max 2) | SHORTS: ENABLED (max 8)
+  Reason: Strong weekly down -4.7% | Below both SMAs | High VIX 25.8
+```
+
+## Telegram Notifications
+
+### Trade Entry
+```
+📉 TRADE ENTRY — SBIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+🕐 Time: 13:45:00
+💵 SELLING SHORT @ ₹1,003.15
+🛑 Stop Loss: ₹1,011.76
+🎯 Target: ₹986.73
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Qty: 14 | Risk: 1.0%
+💰 Risk: ₹120 | Reward: ₹230 (R:R 1.9)
+🎯 Strategy: VWAP_SHORT
+📈 Regime: choppy
+📝 Reason: VWAP overbought +2.9σ RSI=84, ML=SHORT
+```
+
+### Trade Exit
+```
+✅ TRADE CLOSED — SBIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📥 SOLD SHORT: 13:45:00 @ ₹1,003.15
+📤 COVERED: 14:10:00 @ ₹995.50
+⏱️ Held for: 25 min
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Qty: 14 | Return: +0.76%
+💰 P&L: ₹+107.10 | Day: ₹+107.10
+🎯 Strategy: VWAP_SHORT
+📈 Regime: choppy | Exit: TARGET
+```
+
+### EOD Summary (with no-trade reasons)
+```
+📊 END OF DAY SUMMARY — 2026-04-02
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 Market Trend: BEARISH
+📊 VIX: 25.9
+
+📭 NO TRADES TODAY
+
+Possible reasons:
+  • High VIX (25.9) - Market too volatile
+  • No stocks passed ML confidence filter (>12%)
+  • Low liquidity or volatility in scanned stocks
+  • Regime unfavorable for selected strategies
+
+🤖 V3: Dynamic trend | Regime detection | ML filter
 ```
 
 ## APIs & Configuration
@@ -94,8 +181,9 @@ python setup_telegram.py                   # Interactive wizard
 | Training data | 5 years daily OHLCV via yfinance |
 | Retrain | Weekly (Saturday) or on-demand |
 | Scoring | Each stock scored 0-100 → direction LONG (>50) or SHORT (<50) |
+| Confidence | abs(score - 50) / 100 must be ≥12% to trade |
 | Composite | ML score + delivery bonus + trade count + ATR volatility fitness |
-| Selection | Top 8 stocks, max 2 per sector, volume >5L, ATR 0.8-4% |
+| Selection | Top 8-10 stocks, max 2 per sector, volume >5L, ATR 0.8-4.5% |
 
 ## 5 Trading Strategies
 
@@ -103,8 +191,8 @@ python setup_telegram.py                   # Interactive wizard
 |---|----------|-------------|--------------|-------------|
 | 1 | **ORB Breakout** | 9:20-10:30 | First 15min range break with volume | Trending |
 | 2 | **Pullback** | 10:00-11:30 | Re-entry at ORB level after pullback | Trending (LONG only) |
-| 3 | **Momentum** | 11:30-14:00 | 0.6%+ move in 8 candles + volume 1.2x | Trending |
-| 4 | **VWAP Reversion** | 11:00-14:00 | 2.5σ VWAP deviation + RSI extreme | Ranging/Choppy |
+| 3 | **Momentum** | 11:30-14:00 | 0.5%+ move in 8 candles + volume 1.2x | Trending |
+| 4 | **VWAP Reversion** | 11:00-14:00 | 2.0σ VWAP deviation + RSI extreme | Ranging/Choppy |
 | 5 | **Afternoon Trend** | 13:30-14:30 | 5-candle trend + volume 1.3x + VWAP | Trending (60% size) |
 
 All strategies: ML direction lock (no counter-trend) • ATR-based stops • Partial exit at 1x risk • Breakeven trail • 45-min time decay
@@ -125,7 +213,7 @@ Budget: 30 API calls/day • Cached + rate-limited • Safety limits enforced �
 ## Risk Management
 
 1. **Position sizing** — 2% max risk per trade, regime-adjusted (volatile = 50% size)
-2. **Stop loss** — ATR-based, minimum 0.5% floor
+2. **Stop loss** — ATR-based, minimum 0.5% floor (disabled by default - time exits work better)
 3. **Breakeven trail** — SL moves to entry after 1x risk profit
 4. **Partial exit** — 50% position closed at 1x risk
 5. **Time decay** — Flat trades closed after 45 minutes
@@ -146,6 +234,7 @@ nse_algo_trader/
 ├── strategies/
 │   ├── pro_strategy_v2.py    # ORB + pullback + momentum signals
 │   ├── claude_brain_v2.py    # AI brain: morning/live/EOD/news
+│   ├── candle_patterns.py    # Japanese candlestick pattern detection
 │   ├── claude_brain.py       # V1 brain (morning only)
 │   ├── orb_v2.py             # ORB breakout strategy
 │   ├── vwap_v2.py            # VWAP reversion strategy
@@ -156,9 +245,11 @@ nse_algo_trader/
 │   ├── angel_auth.py         # Angel One TOTP login + session cache
 │   ├── angel_ws.py           # WebSocket real-time data + candle builder
 │   ├── angel_symbols.py      # NSE ticker → Angel One token mapper
+│   ├── live_data_provider.py # Multi-source data provider with failover
 │   ├── data_loader.py        # Unified loader (yfinance/kaggle/kite/CSV)
 │   ├── train_pipeline.py     # ML training + feature engineering + scoring
-│   └── data_config.yaml      # Data source configuration
+│   ├── train_v2.py           # V2 ML training with bear market features
+│   └── stock_performance_tracker.py # Rolling performance tracking
 │
 ├── risk/
 │   ├── position_sizer.py     # Risk-based position sizing
@@ -167,14 +258,15 @@ nse_algo_trader/
 │   └── kill_switch.py        # Emergency stop
 │
 ├── backtest/
-│   ├── engine.py             # Event-driven backtest engine
-│   ├── costs.py              # Zerodha fee model (STT, brokerage, GST)
-│   └── runner.py             # Backtest runner
+│   ├── costs.py              # Angel One fee model (STT, brokerage, GST)
+│   ├── production_backtest.py# Production-ready backtest
+│   ├── improved_strategy.py  # Improved strategy backtest
+│   ├── short_only_backtest.py# Short-only strategy test
+│   └── walk_forward.py       # Walk-forward validation
 │
 ├── config/
 │   ├── config_test.yaml      # Test config (Angel One + Claude keys)
 │   ├── config_prod.yaml      # Production config
-│   ├── angel_config.yaml     # Angel One credentials
 │   └── symbols.py            # Nifty 50/100/250 universe
 │
 ├── utils/
@@ -207,19 +299,10 @@ python test_angel.py --ws --ws-duration 120     # WebSocket test (2 min)
 
 ### Live Paper Trading
 ```bash
-python live_paper_v3.py                         # Auto-select best 8 stocks
+python live_paper_v3.py                         # Auto-select best 8-10 stocks
 python live_paper_v3.py --universe nifty50      # From Nifty 50
 python live_paper_v3.py --universe nifty100     # From Nifty 100
 python live_paper_v3.py --stocks HDFCBANK SBIN  # Specific stocks only
-```
-
-### Backtesting
-```bash
-python live_paper_v3.py --backtest 2026-04-01   # Replay a specific day
-python live_paper_v3.py --backtest 2026-03-30   # Another day
-python honest_backtest_30d.py                   # Last 30 days comparison
-python run_backtest.py --last 30                # Legacy 30-day backtest
-python run_backtest.py --date 2020-03-23        # COVID crash test
 ```
 
 ### ML Model
@@ -227,6 +310,7 @@ python run_backtest.py --date 2020-03-23        # COVID crash test
 python -m data.train_pipeline train             # Train on real data (yfinance)
 python -m data.train_pipeline demo              # Train on synthetic data
 python -m data.train_pipeline score             # Score all stocks now
+python -m data.train_v2 train                   # Train V2 model (bear market optimized)
 ```
 
 ### Scheduler (Automated Daily)
@@ -241,26 +325,11 @@ python scheduler.py retrain                     # Force retrain ML model
 python scheduler.py download-data               # Download all stock data
 ```
 
-### Data
-```bash
-python -m data.data_loader status               # Show data sources + cache
-python -m data.data_enricher download-all       # Download enriched NSE data
-```
-
 ### Analysis
 ```bash
 python trade_analysis.py                        # Analyze past results
 python compare_strategies.py                    # Compare strategy performance
 python auto_optimizer.py                        # Auto-tune strategy params
-```
-
-### Old Runners (still work)
-```bash
-python paper_trader.py simulate                 # V1 paper trader
-python paper_trader.py scenarios                # All 5 market scenarios
-python quick_test_today.py                      # Quick single-stock test
-python start_bot.py                             # V1 full-day bot
-python start_bot.py --once                      # V1 single-day run
 ```
 
 ## Data Sources
@@ -277,7 +346,8 @@ python start_bot.py --once                      # V1 single-day run
 | Time | Phase | What Happens |
 |------|-------|--------------|
 | 8:55 AM | Pre-market | Scheduler wakes up, checks holiday |
-| 9:05 AM | Selection | ML scores 50 stocks, Claude reads news, picks top 8 |
+| 9:05 AM | **Market Trend** | Detect BULLISH/BEARISH/NEUTRAL, set direction limits |
+| 9:05 AM | Selection | ML scores 100 stocks, Claude reads news, picks top 8-10 |
 | 9:15 AM | Connect | Angel One login, data streaming starts |
 | 9:20 AM | Trading | Market open, ORB range forms, first signals |
 | 9:20-10:30 | ORB | Breakout trades on high-confidence picks |
@@ -292,22 +362,22 @@ python start_bot.py --once                      # V1 single-day run
 
 ## Recent Results
 
-### April 1, 2026 (Backtest)
+### April 2, 2026 (Backtest - BEARISH Market)
 ```
-Trades: 7 | Won: 3 | WR: 43%
-✅ CIPLA SHORT (ORB)    Rs 1,222 → Rs 1,197  +Rs 154
-✅ CIPLA SHORT (ORB)    Rs 1,222 → Rs 1,195  +Rs 144
-✅ HDFCLIFE SHORT (ORB) Rs 584 → Rs 583      +Rs 22
-❌ SBIN SHORT (VWAP)    Rs 1,017 → Rs 1,024  -Rs 104
-❌ RELIANCE SHORT       Rs 1,366 → Rs 1,369  -Rs 45
-❌ HDFCLIFE SHORT       Rs 572 → Rs 572      -Rs 29
-❌ TCS SHORT            Rs 2,411 → Rs 2,408  -Rs 1
-Net P&L: Rs +141.63
+Market Trend: BEARISH (90% confidence)
+VIX: 25.9 | Weekly: -4.7%
+Direction: 0 LONGS | 8 SHORTS selected
+
+Trades: 3 | Won: 2 | WR: 67%
+✅ ITC SHORT (VWAP)    Rs 292.95 → Rs 290.90  +Rs 43.44
+✅ ITC SHORT (VWAP)    Rs 292.95 → Rs 292.30  +Rs 8.75
+❌ CIPLA SHORT (VWAP)  Rs 1,185.90 → Rs 1,184.70  -Rs 0.84
+Net P&L: Rs +51.35
 ```
 
 ## Tech Stack
 
-- **Language:** Python 3.13
+- **Language:** Python 3.10+
 - **ML:** scikit-learn (Random Forest), pandas, numpy
 - **Broker:** Angel One SmartAPI (real-time data, paper/live orders)
 - **Data:** yfinance (free), jugaad_data (NSE enrichment)
@@ -316,20 +386,6 @@ Net P&L: Rs +141.63
 - **IDE:** PyCharm / IntelliJ with run configurations
 - **Deploy:** Render / DigitalOcean / Oracle Cloud (free tier)
 - **CI/CD:** GitHub + cron scheduler
-
-## IntelliJ / PyCharm Run Configs
-
-| Name | What It Does |
-|------|-------------|
-| Test - All APIs | Check Claude + Angel One connectivity |
-| Test - Angel One | Detailed Angel One test suite |
-| Test - Simulate | Paper trade simulation |
-| Test - Crash Day | Crash scenario (VIX 32) |
-| Test - 10 Day Backtest | Multi-day backtest |
-| Test - All Scenarios | Normal + volatile + crash + rally + flat |
-| Train ML Model | Train stock predictor |
-| Analyse Results | Review past results |
-| PROD - Paper Mode | Full system paper trading |
 
 ## Requirements
 
@@ -345,3 +401,7 @@ pyyaml             # Config files
 ```
 
 No paid APIs needed for backtesting. Angel One is free. Claude API ~Rs 250-330/month (optional but recommended).
+
+## License
+
+MIT License - Use at your own risk. This is for educational purposes. Always paper trade first!

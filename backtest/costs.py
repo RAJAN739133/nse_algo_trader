@@ -1,9 +1,13 @@
 """
-Zerodha cost model for intraday equity trades.
+Cost models for intraday equity trades (NSE India).
 Includes all real-world charges so backtest P&L matches actual trading.
 
-Charges per trade (as of 2025):
-- Brokerage: ₹20 per executed order (or 0.03%, whichever is lower)
+Supports multiple brokers:
+- Angel One (default)
+- Generic cost model
+
+Charges per trade (as of 2025-2026):
+- Brokerage: ₹20 per executed order (flat fee for both Angel One & Zerodha)
 - STT: 0.025% on sell side only (intraday equity)
 - Exchange txn: 0.00345% (NSE)
 - GST: 18% on (brokerage + exchange txn)
@@ -26,11 +30,11 @@ class TradeCosts:
     total_percent: float  # as % of turnover
 
 
-class ZerodhaCostModel:
-    """Calculate all charges for an intraday equity trade on Zerodha."""
+class AngelOneCostModel:
+    """Calculate all charges for an intraday equity trade on Angel One."""
 
-    BROKERAGE_FLAT = 20.0           # ₹20 per order
-    BROKERAGE_PCT = 0.0003          # 0.03%
+    BROKERAGE_FLAT = 20.0           # ₹20 per order (Angel One flat fee)
+    BROKERAGE_PCT = 0.0003          # 0.03% (not used, Angel One is flat ₹20)
     STT_RATE = 0.00025              # 0.025% on sell side
     EXCHANGE_TXN_RATE = 0.0000345   # 0.00345%
     GST_RATE = 0.18                 # 18% on brokerage + exchange
@@ -108,3 +112,7 @@ class ZerodhaCostModel:
             "yearly": round(monthly * 12, 2),
             "breakdown": single_trade,
         }
+
+
+# Alias for backward compatibility
+ZerodhaCostModel = AngelOneCostModel

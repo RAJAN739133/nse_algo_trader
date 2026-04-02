@@ -3,15 +3,17 @@ Claude Brain V2 — Live Adaptive AI Strategy Engine
 
 Unlike V1 (morning-only), V2 is called THROUGHOUT the trading day:
   1. PRE-MARKET (8:50 AM): Morning brief + risk level + stock picks
-  2. LIVE MARKET (every 30 min): Adjust strategies, skip/add stocks, change stops
-  3. MID-DAY (12:30 PM): Re-evaluate positions, news scan, direction changes
-  4. POST-MARKET (3:30 PM): EOD analysis, learn from today's mistakes
+  2. LIVE MARKET (every 5 min during market): Quick regime check, strategy adjustment
+  3. FULL SCAN (every 15 min): Deep analysis with news, adjust strategies
+  4. NON-MARKET (every 6 hours): News scan, next-day preparation
+  5. POST-MARKET (3:30 PM): EOD analysis, learn from today's mistakes
 
 Features:
   - Reads ML model scores and adjusts confidence per stock
   - Fetches live market news (Google News RSS) and analyzes sentiment
   - Creates dynamic strategy rules based on current market regime
   - Suggests emergency exits or new entries mid-day
+  - Analyzes market trends (Nifty, VIX, sector rotation)
   - Learns from past trade history to avoid repeating mistakes
 
 Safety: All suggestions validated against hard limits. Claude NEVER
@@ -29,7 +31,10 @@ SAFETY_LIMITS = {
     "max_position_pct": 0.60,
     "min_stop_loss_pct": 0.005,
     "vix_absolute_skip": 35,
-    "max_api_calls_per_day": 30,
+    "max_api_calls_per_day": 50,  # Increased for more frequent scans
+    "quick_scan_interval_sec": 300,   # 5 min during market
+    "full_scan_interval_sec": 900,    # 15 min full analysis
+    "non_market_scan_interval_sec": 21600,  # 6 hours outside market
 }
 
 # Cache to avoid repeated identical calls
@@ -243,18 +248,87 @@ Analyze everything above and return JSON:
         return self._validate_morning(result, vix) if result else self._default_morning(vix)
 
     # ════════════════════════════════════════════════
-    # 2. LIVE MARKET ADJUSTMENT (every 30 min)
+    # 2. QUICK MARKET SCAN (every 5 min during market)
+    # ════════════════════════════════════════════════
+
+    def quick_scan(self, regimes, vix, day_pnl, trades_taken):
+        """
+        Fast 5-minute scan during market hours. Lightweight check.
+        Returns strategy adjustments based on regime changes.
+        """
+        if not self.enabled:
+            return self._default_quick_scan()
+
+        now = datetime.now()
+        
+        # Count regimes
+        regime_counts = {}
+        for sym, reg in regimes.items():
+            regime_counts[reg] = regime_counts.get(reg, 0) + 1
+        
+        # Determine dominant regime
+        dominant = max(regime_counts, key=regime_counts.get) if regime_counts else "unknown"
+        
+        # Quick heuristic response (no API call if simple)
+        if dominant in ("trending_up", "trending_down"):
+            return {
+                "market_trend": dominant,
+                "recommended_strategies": ["ORB", "MOMENTUM", "AFTERNOON_TREND"],
+                "skip_strategies": [],
+                "position_size_factor": 1.0,
+                "notes": f"Market trending {dominant.split('_')[1]}, use trend-following strategies"
+            }
+        elif dominant == "choppy":
+            return {
+                "market_trend": "choppy",
+                "recommended_strategies": ["VWAP", "MOMENTUM"],  # V2: Allow momentum in choppy
+                "skip_strategies": ["AFTERNOON_TREND"],
+                "position_size_factor": 0.7,
+                "notes": "Choppy market - reduce size, prefer mean reversion"
+            }
+        elif dominant == "ranging":
+            return {
+                "market_trend": "ranging",
+                "recommended_strategies": ["VWAP"],
+                "skip_strategies": ["ORB", "AFTERNOON_TREND"],
+                "position_size_factor": 0.6,
+                "notes": "Ranging market - only VWAP with extreme deviation"
+            }
+        elif dominant == "volatile":
+            return {
+                "market_trend": "volatile",
+                "recommended_strategies": ["MOMENTUM"],
+                "skip_strategies": ["VWAP"],
+                "position_size_factor": 0.5,
+                "notes": "High volatility - wider stops, smaller size, momentum only"
+            }
+        
+        return self._default_quick_scan()
+
+    def _default_quick_scan(self):
+        return {
+            "market_trend": "unknown",
+            "recommended_strategies": ["ORB", "MOMENTUM", "VWAP"],
+            "skip_strategies": [],
+            "position_size_factor": 1.0,
+            "notes": "Default scan"
+        }
+
+    # ════════════════════════════════════════════════
+    # 3. FULL LIVE ADJUSTMENT (every 15 min)
     # ════════════════════════════════════════════════
 
     def live_adjustment(self, current_state):
         """
-        Called every 30 min during market hours. Receives current state:
+        Called every 15 min during market hours. Full analysis with Claude.
+        Receives current state:
         - open_positions: [{symbol, side, entry, current, pnl, regime}]
         - day_pnl: float
         - trades_taken: int
         - stock_regimes: {symbol: regime}
         - vix: float
         - time: str (HH:MM)
+        - market_trend: from quick_scan
 
         Returns:
         - emergency_exits: [symbol]
@@ -267,24 +341,37 @@ Analyze everything above and return JSON:
         if not self.enabled:
             return self._default_live()
 
-        # Rate limit: max 1 call per 25 min
+        # Rate limit: max 1 call per 10 min (was 25 min)
         now = datetime.now()
-        if self._last_live_call and (now - self._last_live_call).seconds < 1500:
+        if self._last_live_call and (now - self._last_live_call).seconds < 600:
             return self._default_live()
         self._last_live_call = now
+
+        # Fetch fresh news for context
+        news = _fetch_market_news()
+        news_text = "\n".join([f"- {n['title']}" for n in news[:5]]) if news else "No recent news"
 
         prompt = f"""LIVE MARKET UPDATE — {now.strftime('%H:%M')}
 
 CURRENT STATE:
 {json.dumps(current_state, default=str, indent=2)}
 
-Based on positions, P&L, regimes, and time of day, suggest adjustments.
+LATEST NEWS:
+{news_text}
+
+Analyze market conditions and suggest adjustments.
 
 Return JSON:
 {{
+  "market_analysis": {{
+    "trend": "bullish|bearish|sideways",
+    "strength": 1-10,
+    "key_levels": {{"nifty_support": 0, "nifty_resistance": 0}},
+    "sector_leaders": [],
+    "sector_laggards": []
+  }},
   "emergency_exits": [],
   "tighten_stops": {{}},
-  "widen_stops": {{}},
   "add_stocks": [],
   "remove_stocks": [],
   "strategy_switch": {{}},
@@ -294,17 +381,86 @@ Return JSON:
 }}
 
 Rules:
+- market_analysis: Your view on overall market direction
 - emergency_exits: only if stock is clearly going against position with no recovery
-- tighten_stops: {{symbol: new_sl_price}} — only tighten, never widen beyond original
+- tighten_stops: {{symbol: new_sl_price}} — only tighten, never widen
 - strategy_switch: {{symbol: "MOMENTUM"|"VWAP"|"ORB"|"SKIP"}}
 - new_strategy_rules: [{{"name": "rule_name", "condition": "description", "action": "description"}}]
 - risk_adjustment: 0.5=half size, 1.0=normal, 1.5=increase (only if winning)"""
 
-        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=800)
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=1000)
         return self._validate_live(result) if result else self._default_live()
 
     # ════════════════════════════════════════════════
-    # 3. STOCK ANALYSIS (on-demand)
+    # 4. MARKET TREND ANALYSIS
+    # ════════════════════════════════════════════════
+
+    def analyze_market_trend(self, nifty_data=None, vix=None, sector_data=None):
+        """
+        Analyze overall market trend and suggest strategy adjustments.
+        Called periodically to understand market direction.
+        
+        Returns:
+        - trend: bullish/bearish/sideways
+        - strength: 1-10
+        - recommended_direction: LONG/SHORT/BOTH
+        - sector_rotation: which sectors to focus
+        - strategy_preference: which strategies work best now
+        """
+        if not self.enabled:
+            return self._default_market_trend()
+
+        prompt = f"""MARKET TREND ANALYSIS
+
+VIX: {vix or 'N/A'}
+Nifty Data: {json.dumps(nifty_data or {}, default=str)}
+Sector Performance: {json.dumps(sector_data or {}, default=str)}
+
+Current Time: {datetime.now().strftime('%H:%M')}
+
+Analyze the market and provide trading direction:
+
+Return JSON:
+{{
+  "trend": "bullish|bearish|sideways",
+  "strength": 7,
+  "confidence": 75,
+  "recommended_direction": "LONG|SHORT|BOTH",
+  "avoid_direction": "LONG|SHORT|NONE",
+  "sector_focus": ["IT", "Banking"],
+  "sector_avoid": ["Metals"],
+  "strategy_preference": {{
+    "trending_market": ["ORB", "MOMENTUM"],
+    "current_recommendation": ["MOMENTUM", "VWAP"]
+  }},
+  "key_insight": "one line market insight",
+  "risk_level": "low|medium|high"
+}}"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=600)
+        if result:
+            return result
+        return self._default_market_trend()
+
+    def _default_market_trend(self):
+        return {
+            "trend": "sideways",
+            "strength": 5,
+            "confidence": 50,
+            "recommended_direction": "BOTH",
+            "avoid_direction": "NONE",
+            "sector_focus": [],
+            "sector_avoid": [],
+            "strategy_preference": {
+                "trending_market": ["ORB", "MOMENTUM"],
+                "current_recommendation": ["VWAP", "MOMENTUM"]
+            },
+            "key_insight": "No Claude analysis available",
+            "risk_level": "medium"
+        }
+
+    # ════════════════════════════════════════════════
+    # 5. STOCK ANALYSIS (on-demand)
     # ════════════════════════════════════════════════
 
     def analyze_stock(self, symbol, candle_summary, ml_score, direction, regime, news=None):

@@ -3,14 +3,87 @@ Angel One Paper/Live Broker
 - Paper mode: logs dummy orders, tracks positions, uses real market data
 - Live mode:  places real orders via SmartAPI (future)
 - Real-time data via WebSocket or REST LTP fallback
+- Auto-refresh: detects token expiration and re-authenticates
 """
 import json, logging, time
 from datetime import datetime, date
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from functools import wraps
 
 logger = logging.getLogger(__name__)
+
+# Angel One error codes that indicate token expiration
+TOKEN_EXPIRED_ERRORS = {"AG8001", "AB8050", "AB1010"}
+TOKEN_EXPIRED_MESSAGES = {"invalid token", "session expired", "token expired"}
+
+# Rate limit errors - need to wait and retry
+RATE_LIMIT_ERRORS = {"exceeding access rate", "rate limit", "too many requests"}
+
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SEC = 2
+MAX_BACKOFF_SEC = 30
+
+
+def _is_rate_limited(error_response):
+    """Check if an API error indicates rate limiting."""
+    if isinstance(error_response, dict):
+        message = str(error_response.get("message", "")).lower()
+        if any(msg in message for msg in RATE_LIMIT_ERRORS):
+            return True
+    if isinstance(error_response, str):
+        lower = error_response.lower()
+        if any(msg in lower for msg in RATE_LIMIT_ERRORS):
+            return True
+    return False
+
+
+def retry_with_backoff(func):
+    """Decorator to retry API calls with exponential backoff on rate limits."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        last_exception = None
+        backoff = INITIAL_BACKOFF_SEC
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = func(*args, **kwargs)
+                
+                # Check for rate limit in response
+                if isinstance(result, dict) and result.get("success") is False:
+                    error_msg = result.get("message", "")
+                    if _is_rate_limited(result) or _is_rate_limited(error_msg):
+                        if attempt < MAX_RETRIES - 1:
+                            logger.warning(f"Rate limited, waiting {backoff}s before retry {attempt + 2}/{MAX_RETRIES}")
+                            time.sleep(backoff)
+                            backoff = min(backoff * 2, MAX_BACKOFF_SEC)
+                            continue
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                error_str = str(e)
+                
+                # Check if rate limited
+                if _is_rate_limited(error_str):
+                    if attempt < MAX_RETRIES - 1:
+                        logger.warning(f"Rate limited, waiting {backoff}s before retry {attempt + 2}/{MAX_RETRIES}")
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, MAX_BACKOFF_SEC)
+                        continue
+                
+                # For other errors, don't retry
+                raise
+        
+        # All retries exhausted
+        if last_exception:
+            raise last_exception
+        return None
+    
+    return wrapper
 
 
 @dataclass
@@ -46,11 +119,50 @@ class Position:
     entry_time: str = ""
 
 
+def _is_token_expired(error_response):
+    """Check if an API error indicates token expiration."""
+    if isinstance(error_response, dict):
+        error_code = str(error_response.get("errorCode", ""))
+        message = str(error_response.get("message", "")).lower()
+        if error_code in TOKEN_EXPIRED_ERRORS:
+            return True
+        if any(msg in message for msg in TOKEN_EXPIRED_MESSAGES):
+            return True
+    if isinstance(error_response, str):
+        lower = error_response.lower()
+        if any(msg in lower for msg in TOKEN_EXPIRED_MESSAGES):
+            return True
+    return False
+
+
+def auto_refresh_token(method):
+    """Decorator to auto-refresh token on expiration errors."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            result = method(self, *args, **kwargs)
+            if isinstance(result, dict) and result.get("success") is False:
+                if _is_token_expired(result):
+                    logger.warning(f"Token expired during {method.__name__}, refreshing...")
+                    if self._refresh_session():
+                        return method(self, *args, **kwargs)
+            return result
+        except Exception as e:
+            error_str = str(e)
+            if _is_token_expired(error_str):
+                logger.warning(f"Token expired during {method.__name__}, refreshing...")
+                if self._refresh_session():
+                    return method(self, *args, **kwargs)
+            raise
+    return wrapper
+
+
 class AngelBroker:
     """
     Angel One Broker — handles both paper and live mode.
     Paper mode: uses real Angel One data but places no real orders.
     Live mode:  places real orders (requires explicit opt-in).
+    Auto-refresh: automatically re-authenticates when token expires.
     """
 
     def __init__(self, config):
@@ -78,6 +190,10 @@ class AngelBroker:
         # LTP cache
         self._ltp_cache = {}
         self._ltp_cache_time = {}
+
+        # Token refresh tracking
+        self._last_refresh_attempt = 0
+        self._refresh_cooldown = 30  # seconds between refresh attempts
 
     # ════════════════════════════════════════════════
     # CONNECTION
@@ -111,6 +227,49 @@ class AngelBroker:
 
     def is_connected(self):
         return self.smart_api is not None
+
+    def _refresh_session(self):
+        """
+        Force re-login to Angel One, bypassing cached session.
+        Returns True if successful, False otherwise.
+        """
+        now = time.time()
+        if now - self._last_refresh_attempt < self._refresh_cooldown:
+            logger.debug("Token refresh on cooldown, skipping")
+            return False
+
+        self._last_refresh_attempt = now
+        logger.info("Refreshing Angel One session...")
+
+        try:
+            from data.angel_auth import AngelAuth, SESSION_FILE
+
+            # Delete cached session to force fresh login
+            if SESSION_FILE.exists():
+                SESSION_FILE.unlink()
+                logger.debug("Deleted stale session file")
+
+            # Re-authenticate
+            self.auth = AngelAuth(
+                api_key=self.api_key,
+                client_code=self.client_code,
+                pin=self.pin,
+                totp_secret=self.totp_secret,
+            )
+            self.smart_api = self.auth.login()
+
+            # Verify new session
+            try:
+                profile = self.smart_api.getProfile(self.auth.refresh_token)
+                name = profile.get("data", {}).get("name", "Unknown")
+                logger.info(f"Session refreshed successfully — {name}")
+            except Exception:
+                logger.info("Session refreshed (profile check skipped)")
+
+            return True
+        except Exception as e:
+            logger.error(f"Session refresh failed: {e}")
+            return False
 
     # ════════════════════════════════════════════════
     # REAL-TIME DATA
@@ -155,12 +314,24 @@ class AngelBroker:
         if not self.is_connected():
             return None
 
+        return self._get_ltp_with_refresh(symbol, now)
+
+    def _get_ltp_with_refresh(self, symbol, now, retry=True):
+        """Internal LTP fetch with auto-refresh on token expiration."""
         try:
             token = self.symbol_mapper.get_token(symbol)
             if not token:
                 return None
             trading_sym = self.symbol_mapper.get_trading_symbol(symbol)
             data = self.smart_api.ltpData("NSE", trading_sym, token)
+
+            # Check for token expiration in response
+            if isinstance(data, dict) and data.get("success") is False:
+                if _is_token_expired(data) and retry:
+                    logger.warning(f"Token expired during LTP fetch for {symbol}, refreshing...")
+                    if self._refresh_session():
+                        return self._get_ltp_with_refresh(symbol, now, retry=False)
+
             if data and data.get("data"):
                 ltp = float(data["data"].get("ltp", 0))
                 if ltp > 0:
@@ -168,6 +339,11 @@ class AngelBroker:
                     self._ltp_cache_time[symbol] = now
                     return ltp
         except Exception as e:
+            error_str = str(e)
+            if _is_token_expired(error_str) and retry:
+                logger.warning(f"Token expired during LTP fetch for {symbol}, refreshing...")
+                if self._refresh_session():
+                    return self._get_ltp_with_refresh(symbol, now, retry=False)
             logger.debug(f"LTP fetch failed for {symbol}: {e}")
         return self._ltp_cache.get(symbol)
 
@@ -176,7 +352,6 @@ class AngelBroker:
         if not self.is_connected():
             return {}
 
-        result = {}
         tokens = {}
         for sym in symbols:
             token = self.symbol_mapper.get_token(sym)
@@ -184,14 +359,27 @@ class AngelBroker:
                 tokens[token] = sym
 
         if not tokens:
-            return result
+            return {}
 
+        return self._get_market_data_with_refresh(tokens, retry=True)
+
+    def _get_market_data_with_refresh(self, tokens, retry=True):
+        """Internal market data fetch with auto-refresh on token expiration."""
+        result = {}
         try:
             exchange_tokens = {"NSE": list(tokens.keys())}
             data = self.smart_api.getMarketData(
                 mode="FULL",
                 exchange_tokens=exchange_tokens,
             )
+
+            # Check for token expiration in response
+            if isinstance(data, dict) and data.get("success") is False:
+                if _is_token_expired(data) and retry:
+                    logger.warning("Token expired during market data fetch, refreshing...")
+                    if self._refresh_session():
+                        return self._get_market_data_with_refresh(tokens, retry=False)
+
             if data and data.get("data", {}).get("fetched"):
                 for item in data["data"]["fetched"]:
                     token = str(item.get("symbolToken", ""))
@@ -206,6 +394,11 @@ class AngelBroker:
                             "volume": item.get("tradeVolume", 0),
                         }
         except Exception as e:
+            error_str = str(e)
+            if _is_token_expired(error_str) and retry:
+                logger.warning("Token expired during market data fetch, refreshing...")
+                if self._refresh_session():
+                    return self._get_market_data_with_refresh(tokens, retry=False)
             logger.warning(f"Market data fetch failed: {e}")
         return result
 
@@ -259,8 +452,8 @@ class AngelBroker:
         self.orders.append(order)
         return order
 
-    def _place_real_order(self, order):
-        """Place a real order via Angel One SmartAPI."""
+    def _place_real_order(self, order, retry=True):
+        """Place a real order via Angel One SmartAPI with auto-refresh."""
         if not self.is_connected():
             order.status = "REJECTED"
             logger.error("Cannot place real order — not connected")
@@ -285,6 +478,14 @@ class AngelBroker:
                 params["triggerprice"] = str(order.trigger_price)
 
             resp = self.smart_api.placeOrder(params)
+
+            # Check for token expiration in response
+            if isinstance(resp, dict) and resp.get("success") is False:
+                if _is_token_expired(resp) and retry:
+                    logger.warning("Token expired during order placement, refreshing...")
+                    if self._refresh_session():
+                        return self._place_real_order(order, retry=False)
+
             if resp:
                 order.order_id = str(resp)
                 order.status = "PLACED"
@@ -293,6 +494,11 @@ class AngelBroker:
                 order.status = "REJECTED"
                 logger.error(f"[LIVE] Order rejected: {order.symbol}")
         except Exception as e:
+            error_str = str(e)
+            if _is_token_expired(error_str) and retry:
+                logger.warning("Token expired during order placement, refreshing...")
+                if self._refresh_session():
+                    return self._place_real_order(order, retry=False)
             order.status = "REJECTED"
             logger.error(f"[LIVE] Order failed: {e}")
         return order
@@ -380,13 +586,19 @@ class AngelBroker:
         """Fetch historical candles via Angel One REST API."""
         if not self.is_connected():
             return None
+
+        token = self.symbol_mapper.get_token(symbol)
+        if not token:
+            return None
+
+        return self._get_historical_candles_with_refresh(symbol, token, interval, days, retry=True)
+
+    def _get_historical_candles_with_refresh(self, symbol, token, interval, days, retry=True, attempt=0):
+        """Internal historical candles fetch with auto-refresh and rate limit handling."""
         try:
             import pandas as pd
             from datetime import timedelta
-            token = self.symbol_mapper.get_token(symbol)
-            if not token:
-                return None
-            trading_sym = self.symbol_mapper.get_trading_symbol(symbol)
+
             to_date = datetime.now()
             from_date = to_date - timedelta(days=days)
             params = {
@@ -397,13 +609,55 @@ class AngelBroker:
                 "todate": to_date.strftime("%Y-%m-%d %H:%M"),
             }
             data = self.smart_api.getCandleData(params)
+
+            # Check for token expiration in response
+            if isinstance(data, dict) and data.get("success") is False:
+                error_msg = data.get("message", "")
+                
+                # Handle token expiration
+                if _is_token_expired(data) and retry:
+                    logger.warning(f"Token expired during candle fetch for {symbol}, refreshing...")
+                    if self._refresh_session():
+                        return self._get_historical_candles_with_refresh(symbol, token, interval, days, retry=False, attempt=0)
+                    return None
+                
+                # Handle rate limiting with exponential backoff
+                if _is_rate_limited(data) or _is_rate_limited(error_msg):
+                    if attempt < MAX_RETRIES:
+                        backoff = min(INITIAL_BACKOFF_SEC * (2 ** attempt), MAX_BACKOFF_SEC)
+                        logger.debug(f"Rate limited on {symbol}, waiting {backoff}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                        time.sleep(backoff)
+                        return self._get_historical_candles_with_refresh(symbol, token, interval, days, retry=retry, attempt=attempt + 1)
+                    else:
+                        logger.warning(f"Rate limit retries exhausted for {symbol}")
+                        return None
+                
+                return None
+
             if data and data.get("data"):
                 df = pd.DataFrame(data["data"],
                                   columns=["datetime", "open", "high", "low", "close", "volume"])
                 df["datetime"] = pd.to_datetime(df["datetime"])
                 df["symbol"] = symbol
                 return df
+                
         except Exception as e:
+            error_str = str(e)
+            
+            # Handle token expiration
+            if _is_token_expired(error_str) and retry:
+                logger.warning(f"Token expired during candle fetch for {symbol}, refreshing...")
+                if self._refresh_session():
+                    return self._get_historical_candles_with_refresh(symbol, token, interval, days, retry=False, attempt=0)
+            
+            # Handle rate limiting
+            if _is_rate_limited(error_str):
+                if attempt < MAX_RETRIES:
+                    backoff = min(INITIAL_BACKOFF_SEC * (2 ** attempt), MAX_BACKOFF_SEC)
+                    logger.debug(f"Rate limited on {symbol}, waiting {backoff}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(backoff)
+                    return self._get_historical_candles_with_refresh(symbol, token, interval, days, retry=retry, attempt=attempt + 1)
+            
             logger.warning(f"Historical candle fetch failed for {symbol}: {e}")
         return None
 

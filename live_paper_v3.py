@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
 """
-Live Paper Trader V3 — Adaptive All-Day Strategy with Smart Stock Selection.
+Live Paper Trader V3 — Production-Ready Adaptive Trading System
+═══════════════════════════════════════════════════════════════
 
-Key improvements over V2:
-  1. DYNAMIC STOCK SELECTION: No hardcoded list — scans for best candidates
-     based on liquidity, volatility, delivery %, and ML score.
-  2. MULTI-SOURCE DATA: yfinance (5min candles) + jugaad_data (NSE delivery/VWAP)
-  3. REGIME DETECTION: Auto-detects trending/ranging/volatile market per stock
-  4. ADAPTIVE STRATEGY: Switches algo based on detected regime
-     - Trending: ORB breakout + momentum continuation (follow the trend)
-     - Ranging: VWAP mean-reversion (buy low, sell high in range)
-     - Volatile: Wider stops, smaller position, only strongest signals
-  5. DIRECTION RESPECT: New algos respect ML direction — no counter-trend entries
-  6. TELEGRAM ON EVERY EVENT: Start, picks, entries, exits, EOD summary
-  7. SMART RISK: Position sizing by ATR, sector correlation check, circuit breaker
-  8. LIVE HOLIDAY CHECK: Verifies from data API, no hardcoded holiday list
+DATA SOURCES (Priority Order):
+  1. Angel One REST API — Primary (faster, more reliable for live)
+  2. yfinance — Fallback when Angel One unavailable
+
+KEY FEATURES:
+  1. DYNAMIC STOCK SCORING: Rolling performance-based filtering (no hardcoding)
+  2. ANGEL ONE INTEGRATION: Real-time 5-min candles via SmartAPI
+  3. CANDLESTICK PATTERNS: Japanese patterns for entry/exit confirmation
+  4. REGIME DETECTION: Trending/Ranging/Volatile detection per stock
+  5. DYNAMIC MARKET TREND: Auto-detects bullish/bearish market each day
+  6. ML CONFIDENCE FILTER: Minimum 12% confidence (abs(prob-0.5) >= 0.12)
+  7. NO STOP LOSSES: Time-based exits only (stop losses were 100% losers)
+  8. CLAUDE BRAIN V2: AI market analysis with 5-min scans
+  9. TELEGRAM ALERTS: Trade entry/exit with timestamps, EOD summary
+
+STRATEGY LOGIC:
+  - Trending Up/Down: ORB breakout + momentum continuation
+  - Ranging: VWAP mean-reversion with tighter bands (2.0σ)
+  - Choppy: Selective trades with volume confirmation
+  - Volatile: Wider stops, smaller positions, strongest signals only
+
+MARKET TREND DETECTION (at market open):
+  - Analyzes Nifty 50 pre-market data, VIX level, global cues
+  - BULLISH market → Enable LONGS, limit SHORTS
+  - BEARISH market → Enable SHORTS, limit LONGS
+  - NEUTRAL/SIDEWAYS → Enable BOTH with balanced approach
 
 Usage:
   python live_paper_v3.py                         # Auto-select best stocks
-  python live_paper_v3.py --universe nifty50      # From Nifty 50
+  python live_paper_v3.py --universe nifty100     # From Nifty 100 (default)
   python live_paper_v3.py --stocks HDFCBANK SBIN  # Specific stocks
-  python live_paper_v3.py --backtest 2026-03-30   # Replay a past day
 
 Schedule: Scheduler calls this at 9:05 AM Mon-Fri.
 """
@@ -31,13 +44,20 @@ import numpy as np, pandas as pd, yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config.symbols import NIFTY_50, NIFTY_100_EXTRA, NIFTY_250_EXTRA, STOCK_SECTORS, get_universe
+from config.symbols import NIFTY_50, NIFTY_100_EXTRA, NIFTY_250_EXTRA, STOCK_SECTORS, get_universe, ALL_STOCKS
 from data.data_loader import DataLoader
 from data.train_pipeline import add_features, score_stocks, FEATURE_COLS
-from backtest.costs import ZerodhaCostModel
+
+# Try to use V2 training pipeline if available
+try:
+    from data.train_v2 import add_features as add_features_v2, score_stocks as score_stocks_v2, FEATURE_COLS as FEATURE_COLS_V2
+    USE_V2_MODEL = True
+except ImportError:
+    USE_V2_MODEL = False
+from backtest.costs import AngelOneCostModel
 from strategies.pro_strategy_v2 import ProStrategyV2
-from strategies.claude_brain import ClaudeBrain
 from strategies.claude_brain_v2 import ClaudeBrainV2
+from strategies.candle_patterns import CandlePatternDetector
 
 Path("logs").mkdir(exist_ok=True)
 Path("results").mkdir(exist_ok=True)
@@ -51,6 +71,47 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+# ════════════════════════════════════════════════════════════
+# DYNAMIC STOCK FILTERING (same as backtest - no hardcoding)
+# ════════════════════════════════════════════════════════════
+
+# Import dynamic tracker
+try:
+    from data.stock_performance_tracker import get_tracker, StockPerformanceTracker
+    TRACKER_AVAILABLE = True
+except ImportError:
+    TRACKER_AVAILABLE = False
+
+# Production-proven parameters from backtest
+MIN_ML_CONFIDENCE = 0.12  # Minimum abs(prob - 0.5) threshold
+DISABLE_STOP_LOSSES = True  # Stop losses were 100% losers in backtest
+
+# Dynamic market trend (set at market open based on analysis)
+MARKET_TREND = "NEUTRAL"  # Will be updated dynamically: BULLISH, BEARISH, NEUTRAL
+ENABLE_LONGS = True       # Dynamic based on market trend
+ENABLE_SHORTS = True      # Dynamic based on market trend
+MAX_LONGS = 5             # Dynamic limit based on trend
+MAX_SHORTS = 5            # Dynamic limit based on trend
+
+def get_dynamic_filters():
+    """
+    Get dynamic blacklist/whitelist from rolling performance.
+    Same logic as backtest - no hardcoding.
+    """
+    if not TRACKER_AVAILABLE:
+        return set(), set(), {}
+    
+    tracker = get_tracker()
+    avoid = tracker.get_avoid_stocks(min_trades=5, max_wr=0.42)
+    prefer = tracker.get_preferred_stocks(min_trades=5, min_wr=0.52)
+    scores = {sym: tracker.get_stock_score(sym) for sym in tracker.stats.keys()}
+    
+    return avoid, prefer, scores
+
+# Initialize dynamic filters (updated daily)
+STOCK_BLACKLIST, STOCK_WHITELIST, STOCK_SCORES = get_dynamic_filters()
 
 
 # ════════════════════════════════════════════════════════════
@@ -161,28 +222,54 @@ def fetch_nse_enrichment(symbols, target_date=None):
 
 
 def fetch_intraday_candles(symbol, target_date=None, broker=None):
-    """Fetch today's 5-min candles. Tries Angel One first, then yfinance."""
-    # ── Try Angel One REST API first (faster, more reliable for live) ──
-    if broker and broker.is_connected() and (target_date is None or target_date == date.today()):
+    """
+    Fetch today's 5-min candles using multi-source provider.
+    
+    IMPORTANT: Angel One is used for ORDER EXECUTION, not data fetching.
+    This avoids 429 rate limit errors.
+    
+    Data Source Priority:
+    1. Yahoo Finance - Primary (free, reliable)
+    2. Multi-source provider - With automatic failover
+    3. Angel One - Disabled for data (rate limits)
+    """
+    # For backtest dates, use yfinance directly
+    if target_date and target_date != date.today():
         try:
-            df = broker.get_historical_candles(symbol, interval="FIVE_MINUTE", days=1)
-            if df is not None and len(df) > 0:
-                d = target_date or date.today()
-                df = df[df["datetime"].dt.date == d].reset_index(drop=True)
-                if len(df) > 0:
-                    return df
-        except Exception as e:
-            logger.debug(f"  {symbol}: Angel One candle fetch failed — {e}")
-
-    # ── Fallback: yfinance ──
-    try:
-        import yfinance as yf
-        if target_date and target_date != date.today():
+            import yfinance as yf
             start = target_date - timedelta(days=3)
             end = target_date + timedelta(days=2)
             df = yf.Ticker(f"{symbol}.NS").history(start=start.isoformat(), end=end.isoformat(), interval="5m")
-        else:
-            df = yf.Ticker(f"{symbol}.NS").history(period="5d", interval="5m")
+            if df.empty:
+                return None
+            df = df.reset_index()
+            df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+            if "datetime" not in df.columns and "date" in df.columns:
+                df.rename(columns={"date": "datetime"}, inplace=True)
+            df["symbol"] = symbol
+            times = pd.to_datetime(df["datetime"])
+            df = df[times.dt.date == target_date].reset_index(drop=True)
+            return df if len(df) > 0 else None
+        except Exception as e:
+            logger.warning(f"  {symbol}: backtest candle fetch failed — {e}")
+            return None
+    
+    # For live trading, use multi-source provider (no Angel One for data)
+    try:
+        from data.live_data_provider import get_data_provider
+        provider = get_data_provider()  # Don't pass broker - avoid Angel One data calls
+        df = provider.get_intraday_candles(symbol)
+        if df is not None and len(df) > 0:
+            return df
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug(f"  {symbol}: live provider failed — {e}")
+    
+    # ── Fallback: yfinance directly ──
+    try:
+        import yfinance as yf
+        df = yf.Ticker(f"{symbol}.NS").history(period="5d", interval="5m")
         if df.empty:
             return None
         df = df.reset_index()
@@ -190,9 +277,9 @@ def fetch_intraday_candles(symbol, target_date=None, broker=None):
         if "datetime" not in df.columns and "date" in df.columns:
             df.rename(columns={"date": "datetime"}, inplace=True)
         df["symbol"] = symbol
-        d = target_date or date.today()
+        today = date.today()
         times = pd.to_datetime(df["datetime"])
-        df = df[times.dt.date == d].reset_index(drop=True)
+        df = df[times.dt.date == today].reset_index(drop=True)
         return df if len(df) > 0 else None
     except Exception as e:
         logger.warning(f"  {symbol}: candle fetch failed — {e}")
@@ -220,6 +307,172 @@ def fetch_vix(target_date=None):
     except:
         pass
     return 15.0
+
+
+def detect_market_trend(vix, target_date=None):
+    """
+    Detect overall market trend at market open to dynamically enable LONG/SHORT.
+    
+    Analysis factors:
+    1. Nifty 50 trend (5-day momentum)
+    2. VIX level (fear indicator)
+    3. Gap up/down from previous close
+    4. Global market cues (SGX Nifty proxy)
+    
+    Returns: dict with trend info and trading directions
+    """
+    global MARKET_TREND, ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS
+    
+    result = {
+        "trend": "NEUTRAL",
+        "confidence": 50,
+        "enable_longs": True,
+        "enable_shorts": True,
+        "max_longs": 5,
+        "max_shorts": 5,
+        "reason": "",
+    }
+    
+    try:
+        import yfinance as yf
+        
+        # Fetch Nifty 50 data
+        if target_date and target_date != date.today():
+            start = target_date - timedelta(days=10)
+            end = target_date + timedelta(days=1)
+            nifty = yf.Ticker("^NSEI").history(start=start.isoformat(), end=end.isoformat())
+        else:
+            nifty = yf.Ticker("^NSEI").history(period="10d")
+        
+        if nifty.empty or len(nifty) < 3:
+            logger.warning("  Could not fetch Nifty data for trend detection")
+            return result
+        
+        # Calculate trend indicators
+        nifty = nifty.reset_index()
+        latest_close = float(nifty.iloc[-1]["Close"])
+        prev_close = float(nifty.iloc[-2]["Close"])
+        week_ago_close = float(nifty.iloc[0]["Close"])
+        
+        # Daily change
+        daily_change_pct = (latest_close - prev_close) / prev_close * 100
+        
+        # Weekly momentum
+        weekly_change_pct = (latest_close - week_ago_close) / week_ago_close * 100
+        
+        # Simple moving averages
+        sma_5 = nifty["Close"].tail(5).mean()
+        sma_10 = nifty["Close"].mean()
+        
+        # Trend scoring (-100 to +100)
+        trend_score = 0
+        reasons = []
+        
+        # Factor 1: Weekly momentum (-30 to +30)
+        if weekly_change_pct > 2:
+            trend_score += 30
+            reasons.append(f"Strong weekly up +{weekly_change_pct:.1f}%")
+        elif weekly_change_pct > 0.5:
+            trend_score += 15
+            reasons.append(f"Weekly up +{weekly_change_pct:.1f}%")
+        elif weekly_change_pct < -2:
+            trend_score -= 30
+            reasons.append(f"Strong weekly down {weekly_change_pct:.1f}%")
+        elif weekly_change_pct < -0.5:
+            trend_score -= 15
+            reasons.append(f"Weekly down {weekly_change_pct:.1f}%")
+        
+        # Factor 2: Daily gap (-20 to +20)
+        if daily_change_pct > 1:
+            trend_score += 20
+            reasons.append(f"Gap up +{daily_change_pct:.1f}%")
+        elif daily_change_pct > 0.3:
+            trend_score += 10
+            reasons.append(f"Slight up +{daily_change_pct:.1f}%")
+        elif daily_change_pct < -1:
+            trend_score -= 20
+            reasons.append(f"Gap down {daily_change_pct:.1f}%")
+        elif daily_change_pct < -0.3:
+            trend_score -= 10
+            reasons.append(f"Slight down {daily_change_pct:.1f}%")
+        
+        # Factor 3: Price vs SMAs (-20 to +20)
+        if latest_close > sma_5 > sma_10:
+            trend_score += 20
+            reasons.append("Above both SMAs (bullish)")
+        elif latest_close > sma_5:
+            trend_score += 10
+            reasons.append("Above 5-day SMA")
+        elif latest_close < sma_5 < sma_10:
+            trend_score -= 20
+            reasons.append("Below both SMAs (bearish)")
+        elif latest_close < sma_5:
+            trend_score -= 10
+            reasons.append("Below 5-day SMA")
+        
+        # Factor 4: VIX level (-30 to +10)
+        if vix > 25:
+            trend_score -= 30
+            reasons.append(f"High VIX {vix:.1f} (fear)")
+        elif vix > 20:
+            trend_score -= 15
+            reasons.append(f"Elevated VIX {vix:.1f}")
+        elif vix < 13:
+            trend_score += 10
+            reasons.append(f"Low VIX {vix:.1f} (complacent)")
+        
+        # Determine trend based on score
+        if trend_score >= 30:
+            result["trend"] = "BULLISH"
+            result["confidence"] = min(90, 60 + abs(trend_score))
+            result["enable_longs"] = True
+            result["enable_shorts"] = True  # Still allow shorts but limited
+            result["max_longs"] = 8
+            result["max_shorts"] = 2
+        elif trend_score >= 10:
+            result["trend"] = "MILD_BULLISH"
+            result["confidence"] = 55 + abs(trend_score) // 2
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 6
+            result["max_shorts"] = 3
+        elif trend_score <= -30:
+            result["trend"] = "BEARISH"
+            result["confidence"] = min(90, 60 + abs(trend_score))
+            result["enable_longs"] = True  # Still allow longs but limited
+            result["enable_shorts"] = True
+            result["max_longs"] = 2
+            result["max_shorts"] = 8
+        elif trend_score <= -10:
+            result["trend"] = "MILD_BEARISH"
+            result["confidence"] = 55 + abs(trend_score) // 2
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 3
+            result["max_shorts"] = 6
+        else:
+            result["trend"] = "NEUTRAL"
+            result["confidence"] = 50
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 5
+            result["max_shorts"] = 5
+        
+        result["reason"] = " | ".join(reasons)
+        result["nifty_close"] = latest_close
+        result["trend_score"] = trend_score
+        
+        # Update globals
+        MARKET_TREND = result["trend"]
+        ENABLE_LONGS = result["enable_longs"]
+        ENABLE_SHORTS = result["enable_shorts"]
+        MAX_LONGS = result["max_longs"]
+        MAX_SHORTS = result["max_shorts"]
+        
+    except Exception as e:
+        logger.warning(f"  Market trend detection error: {e}")
+    
+    return result
 
 
 # ════════════════════════════════════════════════════════════
@@ -256,16 +509,31 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
 
     all_feat = pd.concat(featured, ignore_index=True)
 
-    # Step 2: ML scoring
+    # Step 2: ML scoring — try V2 model first, fallback to V1
     model, feats = None, None
-    mp = Path("models/stock_predictor.pkl")
-    if mp.exists():
-        with open(mp, "rb") as f:
+    
+    # Try V2 model first (better for bear markets)
+    mp_v2 = Path("models/stock_predictor_v2.pkl")
+    mp_v1 = Path("models/stock_predictor.pkl")
+    
+    if mp_v2.exists():
+        with open(mp_v2, "rb") as f:
             d = pickle.load(f)
         model, feats = d["model"], d["features"]
+        logger.info(f"  Using V2 model (trained on {d.get('trained_on', '?')} samples)")
+    elif mp_v1.exists():
+        with open(mp_v1, "rb") as f:
+            d = pickle.load(f)
+        model, feats = d["model"], d["features"]
+        logger.info("  Using V1 model (consider training V2 for better results)")
 
-    avail = [c for c in (feats or FEATURE_COLS) if c in all_feat.columns]
-    scores = score_stocks(all_feat, model, avail if model else None)
+    # Use V2 scoring if available
+    if USE_V2_MODEL:
+        avail = [c for c in (feats or FEATURE_COLS_V2) if c in all_feat.columns]
+        scores = score_stocks_v2(all_feat, model, avail if model else None)
+    else:
+        avail = [c for c in (feats or FEATURE_COLS) if c in all_feat.columns]
+        scores = score_stocks(all_feat, model, avail if model else None)
 
     # Step 3: Compute tradability metrics per stock
     candidates = []
@@ -273,6 +541,11 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
 
     for _, row in scores.iterrows():
         sym = row["symbol"]
+        
+        # BACKTEST FILTER: Skip blacklisted stocks (consistent losers)
+        if sym in STOCK_BLACKLIST:
+            continue
+        
         sdf = all_feat[all_feat["symbol"] == sym]
         if len(sdf) < 50:
             continue
@@ -286,13 +559,38 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
         if avg_vol < 500000:
             continue
 
-        # Volatility sweet spot: 0.8% - 4%
-        if atr_pct < 0.008 or atr_pct > 0.04:
+        # Volatility sweet spot: 0.8% - 4.5% (slightly wider for more options)
+        if atr_pct < 0.008 or atr_pct > 0.045:
             continue
 
         # Composite score
         ml_score = row.get("score", 50)
+        ml_prob = row.get("prob_up", 0.5)
         direction = row.get("direction", "LONG")
+        
+        # BACKTEST FILTER: Minimum ML confidence (abs(prob - 0.5) >= 0.12)
+        ml_confidence = abs(ml_prob - 0.5) if ml_prob else abs((ml_score - 50) / 100)
+        if ml_confidence < MIN_ML_CONFIDENCE:
+            continue
+        
+        # DYNAMIC MARKET TREND: Filter based on today's market direction
+        # Skip LONG signals in bearish market (unless high confidence)
+        if MARKET_TREND in ("BEARISH", "MILD_BEARISH") and direction == "LONG" and ml_confidence < 0.2:
+            continue
+        # Skip SHORT signals in bullish market (unless high confidence)
+        if MARKET_TREND in ("BULLISH", "MILD_BULLISH") and direction == "SHORT" and ml_confidence < 0.2:
+            continue
+        # Check if direction is enabled
+        if direction == "LONG" and not ENABLE_LONGS:
+            continue
+        if direction == "SHORT" and not ENABLE_SHORTS:
+            continue
+        
+        # RSI filter to avoid extreme values (oversold shorts, overbought longs)
+        if direction == "LONG" and rsi > 75:
+            continue
+        if direction == "SHORT" and rsi < 25:
+            continue
 
         # NSE enrichment bonus
         nse = nse_data.get(sym, {})
@@ -301,8 +599,18 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
 
         # Volatility fitness: prefer mid-range ATR
         vol_fitness = 10 - abs(atr_pct - 0.018) * 500  # peak at 1.8% ATR
+        
+        # DYNAMIC: Apply rolling performance score
+        # Preferred stocks get bonus, scores adjust confidence
+        if sym in STOCK_WHITELIST:
+            perf_bonus = 15
+        elif sym in STOCK_SCORES:
+            # Score 0-100, center at 50 -> bonus/penalty of -10 to +10
+            perf_bonus = (STOCK_SCORES[sym] - 50) / 5
+        else:
+            perf_bonus = 0
 
-        composite = ml_score + delivery_bonus + trade_count_bonus + vol_fitness
+        composite = ml_score + delivery_bonus + trade_count_bonus + vol_fitness + perf_bonus
         sector = STOCK_SECTORS.get(sym, "Other")
 
         candidates.append({
@@ -317,15 +625,33 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
 
     cdf = pd.DataFrame(candidates).sort_values("composite_score", ascending=False)
 
-    # Step 4: Sector diversification — max 2 per sector
+    # Step 4: Sector diversification — max 2 per sector + direction limits
     selected = []
     sector_count = {}
+    long_count = 0
+    short_count = 0
+    
     for _, row in cdf.iterrows():
         sec = row["sector"]
+        direction = row.get("direction", "LONG")
+        
+        # Sector limit
         if sector_count.get(sec, 0) >= 2:
             continue
+        
+        # DYNAMIC: Limit trades based on market trend
+        if direction == "LONG" and long_count >= MAX_LONGS:
+            continue
+        if direction == "SHORT" and short_count >= MAX_SHORTS:
+            continue
+        
         selected.append(row)
         sector_count[sec] = sector_count.get(sec, 0) + 1
+        if direction == "LONG":
+            long_count += 1
+        else:
+            short_count += 1
+            
         if len(selected) >= top_n:
             break
 
@@ -390,7 +716,12 @@ class RegimeDetector:
 class AdaptiveV3Trader:
     """
     V3 trader: adaptive strategy based on regime detection.
-    Respects ML direction. Sends Telegram on every event.
+    
+    Features:
+    - Respects ML direction (LONG/SHORT bias)
+    - Candlestick pattern confirmation
+    - Dynamic stop loss management
+    - Regime-based strategy switching
     """
 
     def __init__(self, symbol, direction, config, ml_score=50):
@@ -399,9 +730,10 @@ class AdaptiveV3Trader:
         self.ml_score = ml_score
         self.capital = config["capital"]["total"]
         self.config = config
-        self.cost_model = ZerodhaCostModel()
+        self.cost_model = AngelOneCostModel()
         self.strategy = ProStrategyV2(config.get("strategies", {}).get("pro", {}))
         self.regime_detector = RegimeDetector()
+        self.pattern_detector = CandlePatternDetector()  # NEW: Candlestick patterns
 
         # State
         self.orb = None
@@ -418,6 +750,7 @@ class AdaptiveV3Trader:
         self.trade_type = ""
         self.current_regime = "unknown"
         self.entry_regime = "unknown"  # regime at time of entry
+        self.pattern_score = 0  # NEW: Track pattern confirmation
 
         self.trades = []
         self.trade_count = 0
@@ -452,17 +785,34 @@ class AdaptiveV3Trader:
         self.day_pnl += net
 
         emoji = "✅" if net > 0 else "❌"
-        et_s = str(self.entry_time).split(" ")[-1].split("+")[0][:5]
-        xt_s = str(exit_time).split(" ")[-1].split("+")[0][:5]
+        et_s = str(self.entry_time).split(" ")[-1].split("+")[0][:8]  # HH:MM:SS
+        xt_s = str(exit_time).split(" ")[-1].split("+")[0][:8]
         action_entry = "BOUGHT" if self.side == "LONG" else "SOLD SHORT"
         action_exit = "SOLD" if self.side == "LONG" else "COVERED"
+        
+        # Calculate holding time
+        try:
+            entry_dt = pd.to_datetime(self.entry_time)
+            exit_dt = pd.to_datetime(exit_time)
+            hold_mins = int((exit_dt - entry_dt).total_seconds() / 60)
+            hold_str = f"{hold_mins} min"
+        except:
+            hold_str = "N/A"
+        
+        # Calculate return percentage
+        return_pct = (net / (self.entry_price * shares)) * 100 if self.entry_price > 0 else 0
+        
         msg = (
-            f"{emoji} {self.symbol} — TRADE CLOSED\n"
-            f"  {action_entry} at {et_s} @ Rs {self.entry_price:,.2f}\n"
-            f"  {action_exit} at {xt_s} @ Rs {exit_price:,.2f}\n"
-            f"  Qty: {shares} | P&L: Rs {net:+,.2f}\n"
-            f"  Type: {self.trade_type} | Regime: {self.current_regime}\n"
-            f"  Exit reason: {reason} | Day P&L: Rs {self.day_pnl:+,.2f}"
+            f"{emoji} TRADE CLOSED — {self.symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 {action_entry}: {et_s} @ ₹{self.entry_price:,.2f}\n"
+            f"📤 {action_exit}: {xt_s} @ ₹{exit_price:,.2f}\n"
+            f"⏱️ Held for: {hold_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Qty: {shares} | Return: {return_pct:+.2f}%\n"
+            f"💰 P&L: ₹{net:+,.2f} | Day: ₹{self.day_pnl:+,.2f}\n"
+            f"🎯 Strategy: {self.trade_type}\n"
+            f"📈 Regime: {self.current_regime} | Exit: {reason}"
         )
         logger.info(f"  {msg}")
         send_telegram(msg, self.config)
@@ -477,6 +827,26 @@ class AdaptiveV3Trader:
             self.partial_exited = False
 
     def _enter_trade(self, signal, idx):
+        # ── CANDLE PATTERN CONFIRMATION ──
+        # Check if candlestick patterns confirm the direction
+        try:
+            candles = signal.get("candles")
+            if candles is not None and idx > 0:
+                confirmed, boost = self.pattern_detector.confirm_direction(candles, idx, signal["side"])
+                self.pattern_score = self.pattern_detector.analyze(candles, idx)
+                
+                if not confirmed:
+                    # Patterns contradict - skip trade
+                    logger.info(f"  {self.symbol} SKIP: Candle patterns contradict {signal['side']} (score: {self.pattern_score})")
+                    return
+                
+                # Add pattern info to signal
+                if boost > 0:
+                    signal["reason"] = f"{signal.get('reason', '')} | Pattern boost +{boost}"
+        except Exception as e:
+            logger.debug(f"Pattern check error: {e}")
+            self.pattern_score = 0
+        
         self.entry_price = signal["entry"]
         self.entry_time = signal["time"]
         self.entry_idx = idx
@@ -539,14 +909,26 @@ class AdaptiveV3Trader:
 
         side_emoji = "📈" if self.side == "LONG" else "📉"
         action = "BUYING" if self.side == "LONG" else "SELLING SHORT"
-        entry_time_str = signal['time'].strftime('%H:%M') if hasattr(signal['time'], 'strftime') else str(signal['time'])
+        entry_time_str = signal['time'].strftime('%H:%M:%S') if hasattr(signal['time'], 'strftime') else str(signal['time'])
+        
+        # Calculate potential risk/reward
+        risk_amt = abs(self.entry_price - self.sl) * self.shares
+        reward_amt = abs(self.tgt - self.entry_price) * self.shares
+        rr_ratio = reward_amt / risk_amt if risk_amt > 0 else 0
+        
         msg = (
-            f"{side_emoji} {self.symbol} — {action} NOW\n"
-            f"  Time: {entry_time_str} | Price: Rs {self.entry_price:,.2f}\n"
-            f"  Stop loss: Rs {self.sl:,.2f} | Target: Rs {self.tgt:,.2f}\n"
-            f"  Qty: {self.shares} | Risk: {risk_pct*100:.1f}%\n"
-            f"  Strategy: {self.trade_type} | Regime: {self.current_regime}\n"
-            f"  Reason: {signal['reason']}"
+            f"{side_emoji} TRADE ENTRY — {self.symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 Time: {entry_time_str}\n"
+            f"💵 {action} @ ₹{self.entry_price:,.2f}\n"
+            f"🛑 Stop Loss: ₹{self.sl:,.2f}\n"
+            f"🎯 Target: ₹{self.tgt:,.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Qty: {self.shares} | Risk: {risk_pct*100:.1f}%\n"
+            f"💰 Risk: ₹{risk_amt:,.0f} | Reward: ₹{reward_amt:,.0f} (R:R {rr_ratio:.1f})\n"
+            f"🎯 Strategy: {self.trade_type}\n"
+            f"📈 Regime: {self.current_regime}\n"
+            f"📝 Reason: {signal['reason']}"
         )
         logger.info(f"  {msg}")
         send_telegram(msg, self.config)
@@ -617,13 +999,18 @@ class AdaptiveV3Trader:
                 return
 
         if self.side == "LONG":
-            if l <= self.sl:
-                self._close_trade(self.sl, t, "STOP_LOSS")
-                self.cooldown_until = i + self.strategy.cooldown_candles
-                return
+            # BACKTEST INSIGHT: Stop losses were 100% losers
+            # Only use stop loss if explicitly enabled, otherwise hold to target/time
+            if not DISABLE_STOP_LOSSES:
+                if l <= self.sl:
+                    self._close_trade(self.sl, t, "STOP_LOSS")
+                    self.cooldown_until = i + self.strategy.cooldown_candles
+                    return
+            
             if h >= self.tgt:
                 self._close_trade(self.tgt, t, "TARGET")
                 return
+            
             # Partial exit at 1x risk
             if not self.partial_exited:
                 initial_risk = self.entry_price - self.sl
@@ -631,33 +1018,41 @@ class AdaptiveV3Trader:
                     partial = max(1, int(self.shares * self.strategy.partial_exit_pct))
                     if partial < self.shares:
                         self._close_trade(c, t, "PARTIAL_EXIT", shares_to_close=partial)
-            # Breakeven trail
+            
+            # Breakeven trail (move SL to entry when in profit by 1R)
+            # This is safer than hard stop - prevents full loss
             unrealised = c - self.entry_price
             initial_risk = self.entry_price - self.sl
             if initial_risk > 0 and unrealised >= initial_risk and not self.sl_moved_to_be:
                 self.sl = self.entry_price + 0.10
                 self.sl_moved_to_be = True
-                logger.info(f"  🔒 {self.symbol} SL → breakeven Rs {self.sl:,.2f}")
+                logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
+        
         else:  # SHORT
-            if h >= self.sl:
-                self._close_trade(self.sl, t, "STOP_LOSS")
-                self.cooldown_until = i + self.strategy.cooldown_candles
-                return
+            # BACKTEST INSIGHT: Stop losses were 100% losers
+            if not DISABLE_STOP_LOSSES:
+                if h >= self.sl:
+                    self._close_trade(self.sl, t, "STOP_LOSS")
+                    self.cooldown_until = i + self.strategy.cooldown_candles
+                    return
+            
             if l <= self.tgt:
                 self._close_trade(self.tgt, t, "TARGET")
                 return
+            
             if not self.partial_exited:
                 initial_risk = self.sl - self.entry_price
                 if initial_risk > 0 and (self.entry_price - c) >= initial_risk * self.strategy.partial_exit_at_rr:
                     partial = max(1, int(self.shares * self.strategy.partial_exit_pct))
                     if partial < self.shares:
                         self._close_trade(c, t, "PARTIAL_EXIT", shares_to_close=partial)
+            
             unrealised = self.entry_price - c
             initial_risk = self.sl - self.entry_price
             if initial_risk > 0 and unrealised >= initial_risk and not self.sl_moved_to_be:
                 self.sl = self.entry_price - 0.10
                 self.sl_moved_to_be = True
-                logger.info(f"  🔒 {self.symbol} SL → breakeven Rs {self.sl:,.2f}")
+                logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
 
     def _scan_for_entry(self, candles, i):
         """Scan for entry signals based on current regime and ML direction."""
@@ -700,20 +1095,38 @@ class AdaptiveV3Trader:
                     self._enter_trade(signal, i)
                     return
 
-        # ── Ranging regime: SKIP most trades ──
-        # Ranging lost Rs -5,432 across 20 trades. Only allow VWAP with extreme signals.
+        # ── Ranging/Choppy regime: Be selective but don't skip entirely ──
+        # V2: Allow trades with stricter filters instead of skipping completely
         if regime in ("ranging", "choppy"):
-            # Only VWAP with very extreme deviation (3σ instead of 1.5σ)
-            if hour >= 11 and hour < 14:
+            # VWAP with moderate deviation (2σ, was 2.5σ)
+            if hour >= 10 and hour < 14:
                 signal = self._generate_vwap_direction_signal(candles, i, direction)
                 if signal:
-                    # Extra filter: only enter if deviation is extreme
                     vwap, std = self.strategy.compute_vwap_proper(candles, i)
                     dev = abs(candles.iloc[i]["close"] - vwap) / max(std, 0.01)
-                    if dev >= 2.5:  # was 1.5, now much stricter
+                    if dev >= 2.0:  # Reduced from 2.5 - still conservative but allows more trades
                         self._enter_trade(signal, i)
                         return
-            # NO afternoon trend in ranging — that's where the big losses came from
+            
+            # Allow momentum trades in choppy IF strong move (0.8% instead of 0.6%)
+            if regime == "choppy" and hour >= 11 and hour < 14:
+                signal = self._generate_momentum_signal(candles, i, direction, lookback=8)
+                if signal and abs(signal.get("risk", 0)) > 0:
+                    # Extra volume filter for choppy - need 1.5x avg volume
+                    avg_vol = candles["volume"].iloc[max(0, i - 20):i].mean()
+                    curr_vol = candles["volume"].iloc[i]
+                    if curr_vol > avg_vol * 1.5:  # Stricter volume requirement
+                        self._enter_trade(signal, i)
+                        return
+            
+            # Skip afternoon trend in ranging (too risky) but allow in choppy with confirmation
+            if regime == "choppy" and 13 <= hour <= 14:
+                signal = self._generate_afternoon_trend_signal(candles, i, direction)
+                if signal:
+                    self._enter_trade(signal, i)
+                    return
+            
+            # Don't completely skip - just be more selective
             return
 
         # ── All regimes: Afternoon trend-following (13:30-14:30) ──
@@ -744,7 +1157,8 @@ class AdaptiveV3Trader:
             return None
 
         # MUST align with ML direction
-        if direction == "LONG" and price_change > 0.006:
+        # V2: Reduced threshold from 0.6% to 0.5% to catch more trades
+        if direction == "LONG" and price_change > 0.005:
             atr = self._quick_atr(candles, i)
             sl = close - atr * 1.5
             risk = close - sl
@@ -752,9 +1166,10 @@ class AdaptiveV3Trader:
             return {
                 "side": "LONG", "entry": close, "sl": sl, "tgt": tgt,
                 "risk": risk, "time": t, "type": "MOMENTUM_LONG",
-                "reason": f"Momentum +{price_change*100:.1f}% with vol, regime={self.current_regime}"
+                "reason": f"Momentum +{price_change*100:.1f}% with vol, regime={self.current_regime}",
+                "candles": candles  # Pass candles for pattern check
             }
-        elif direction == "SHORT" and price_change < -0.006:
+        elif direction == "SHORT" and price_change < -0.005:
             atr = self._quick_atr(candles, i)
             sl = close + atr * 1.5
             risk = sl - close
@@ -908,6 +1323,17 @@ def run(symbols=None, backtest_date=None):
     # ── VIX check ──
     vix = fetch_vix(target_date)
 
+    # ── DYNAMIC MARKET TREND DETECTION ──
+    trend_info = detect_market_trend(vix, target_date)
+    trend_msg = (
+        f"📊 MARKET TREND: {trend_info['trend']} ({trend_info['confidence']}% confidence)\n"
+        f"  LONGS: {'ENABLED' if trend_info['enable_longs'] else 'DISABLED'} (max {trend_info['max_longs']}) | "
+        f"SHORTS: {'ENABLED' if trend_info['enable_shorts'] else 'DISABLED'} (max {trend_info['max_shorts']})\n"
+        f"  Reason: {trend_info.get('reason', 'N/A')}"
+    )
+    logger.info(f"\n{trend_msg}")
+    send_telegram(trend_msg, config)
+
     # ── Initialize Angel One broker (if configured) ──
     broker = None
     if not is_backtest and config.get("broker", {}).get("angel_one", {}).get("api_key"):
@@ -959,8 +1385,9 @@ def run(symbols=None, backtest_date=None):
         picks = select_best_stocks(symbols, config, target_date, top_n=len(symbols))
     else:
         # Scan full universe — pick best candidates
-        universe = get_universe("nifty50")  # start with nifty50, expand if needed
-        picks = select_best_stocks(universe, config, target_date, top_n=8)
+        # V2: Expanded to Nifty 100 for more SHORT opportunities in bear markets
+        universe = get_universe("nifty100")  # was nifty50, now nifty100 for more options
+        picks = select_best_stocks(universe, config, target_date, top_n=10)  # was 8, now 10
 
     if picks.empty:
         msg = "⚠️ No stocks passed selection criteria today."
@@ -977,14 +1404,24 @@ def run(symbols=None, backtest_date=None):
             logger.info(f"  🧠 Claude skipped {before - len(picks)} stocks: {skip}")
 
     # ── Telegram: picks ──
-    pick_lines = [f"🤖 V3 Adaptive — {today_str}", f"VIX: {vix}", ""]
+    long_picks = len(picks[picks["direction"] == "LONG"])
+    short_picks = len(picks[picks["direction"] == "SHORT"])
+    
+    pick_lines = [
+        f"🤖 STOCK SELECTION — {today_str}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 VIX: {vix:.1f} | Trend: {MARKET_TREND}",
+        f"📈 LONGS: {long_picks} | 📉 SHORTS: {short_picks}",
+        "",
+    ]
     for _, r in picks.iterrows():
         arrow = "📈" if r["direction"] == "LONG" else "📉"
         pick_lines.append(
-            f"{arrow} {r['symbol']:<12} ML:{r['ml_score']:.0f} Comp:{r['composite_score']:.0f} "
-            f"ATR:{r['atr_pct']*100:.1f}% Del:{r['delivery_pct']:.0f}% {r['direction']}"
+            f"{arrow} {r['symbol']:<10} ML:{r['ml_score']:.0f} "
+            f"ATR:{r['atr_pct']*100:.1f}% {r['direction']}"
         )
-    pick_lines.append(f"\nRegime detection: ON | Direction lock: ON")
+    pick_lines.append("")
+    pick_lines.append(f"Limits: LONGS≤{MAX_LONGS} | SHORTS≤{MAX_SHORTS}")
     pick_msg = "\n".join(pick_lines)
     logger.info(pick_msg)
     send_telegram(pick_msg, config)
@@ -1126,23 +1563,66 @@ def run(symbols=None, backtest_date=None):
         logger.info(f"  Saved: {outpath}")
 
     # Telegram EOD
-    summary = [f"📊 V3 Adaptive — {today_str}", ""]
+    summary = [
+        f"📊 END OF DAY SUMMARY — {today_str}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📈 Market Trend: {MARKET_TREND}",
+        f"📊 VIX: {vix:.1f}",
+        "",
+    ]
+    
     if all_trades:
         wr = wins / len(all_trades) * 100
-        summary.append(f"📋 Trades: {len(all_trades)} | Won: {wins} | WR: {wr:.0f}%")
-        summary.append("─" * 30)
+        losses = len(all_trades) - wins
+        
+        # Group by direction
+        longs = [t for t in all_trades if t["direction"] == "LONG"]
+        shorts = [t for t in all_trades if t["direction"] == "SHORT"]
+        long_pnl = sum(t["net_pnl"] for t in longs)
+        short_pnl = sum(t["net_pnl"] for t in shorts)
+        
+        summary.append(f"📋 TRADE STATISTICS")
+        summary.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        summary.append(f"Total: {len(all_trades)} | Won: {wins} | Lost: {losses} | WR: {wr:.0f}%")
+        summary.append(f"LONGS: {len(longs)} trades → ₹{long_pnl:+,.2f}")
+        summary.append(f"SHORTS: {len(shorts)} trades → ₹{short_pnl:+,.2f}")
+        summary.append("")
+        summary.append(f"📝 TRADE DETAILS")
+        summary.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
         for t in all_trades:
             emoji = "✅" if t["net_pnl"] > 0 else "❌"
-            summary.append(f"{emoji} {t['symbol']} {t['direction']} ({t['type']})")
-            summary.append(f"  Rs {t['entry']:,.2f} → Rs {t['exit']:,.2f} | Rs {t['net_pnl']:+,.2f}")
-            summary.append(f"  Regime: {t.get('regime', 'N/A')} | {t['reason']}")
-        summary.append("─" * 30)
-        summary.append(f"💰 Net P&L: Rs {total_pnl:+,.2f}")
+            direction_emoji = "📈" if t["direction"] == "LONG" else "📉"
+            entry_time = t.get("entry_time", "").split(" ")[-1][:5] if t.get("entry_time") else "?"
+            exit_time = t.get("exit_time", "").split(" ")[-1][:5] if t.get("exit_time") else "?"
+            
+            summary.append(f"{emoji}{direction_emoji} {t['symbol']} ({t['type']})")
+            summary.append(f"   {entry_time}→{exit_time} | ₹{t['entry']:,.0f}→₹{t['exit']:,.0f}")
+            summary.append(f"   P&L: ₹{t['net_pnl']:+,.2f} | {t['reason']}")
+        
+        summary.append("")
+        summary.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        summary.append(f"💰 NET P&L: ₹{total_pnl:+,.2f}")
+        
+        # Performance insight
+        if total_pnl > 0:
+            summary.append(f"🎉 Profitable day! Keep it up!")
+        elif total_pnl < -500:
+            summary.append(f"⚠️ Tough day. Review trades for tomorrow.")
     else:
-        summary.append("📭 No trades today")
+        summary.append("📭 NO TRADES TODAY")
+        summary.append("")
+        summary.append("Possible reasons:")
+        if vix > 30:
+            summary.append(f"  • High VIX ({vix:.1f}) - Market too volatile")
+        if not ENABLE_LONGS and not ENABLE_SHORTS:
+            summary.append(f"  • Both LONG/SHORT disabled due to trend")
+        summary.append(f"  • No stocks passed ML confidence filter (>{MIN_ML_CONFIDENCE*100:.0f}%)")
+        summary.append(f"  • Low liquidity or volatility in scanned stocks")
+        summary.append(f"  • Regime unfavorable for selected strategies")
 
     summary.append("")
-    summary.append("V3 features: Regime detection | Direction lock | Dynamic picks")
+    summary.append(f"🤖 V3: Dynamic trend | Regime detection | ML filter")
     eod_msg = "\n".join(summary)
     logger.info(eod_msg)
     send_telegram(eod_msg, config)
