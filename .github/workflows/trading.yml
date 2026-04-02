@@ -97,7 +97,7 @@ jobs:
         if: steps.check_day.outcome == 'success'
         run: |
           echo "Starting at $(date)"
-          python live_paper_v3.py --data-source yfinance
+          python live_paper_v3.py --universe nifty50 --top 10
           echo "Completed at $(date)"
       
       - name: Upload results
