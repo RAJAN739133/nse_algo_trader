@@ -1,0 +1,142 @@
+name: NSE Algo Trader
+
+on:
+  schedule:
+    # Run at 9:00 AM IST (3:30 AM UTC) Monday-Friday
+    - cron: '30 3 * * 1-5'
+  
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'live'
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check if trading day
+        id: check_day
+        run: |
+          python -c "
+          from datetime import date
+          import sys
+          
+          holidays = {
+            '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31',
+            '2026-04-03', '2026-04-14', '2026-05-01', '2026-05-28',
+            '2026-06-26', '2026-08-19', '2026-10-02', '2026-10-20',
+            '2026-10-22', '2026-11-05', '2026-12-25'
+          }
+          
+          today = date.today()
+          if today.weekday() >= 5:
+            print('Weekend')
+            sys.exit(1)
+          if str(today) in holidays:
+            print('Holiday')
+            sys.exit(1)
+          print(f'Trading day: {today}')
+          "
+        continue-on-error: true
+      
+      - name: Setup config from secrets
+        if: steps.check_day.outcome == 'success'
+        run: |
+          mkdir -p config
+          cat > config/angel_config.yaml << 'EOF'
+          angel_one:
+            api_key: "${{ secrets.ANGEL_API_KEY }}"
+            client_code: "${{ secrets.ANGEL_CLIENT_CODE }}"
+            pin: "${{ secrets.ANGEL_PIN }}"
+            totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
+          EOF
+          
+          cat > config/config_prod.yaml << 'EOF'
+          capital:
+            total: 100000
+            risk_per_trade: 0.01
+            max_trades_per_day: 5
+            daily_loss_limit: 0.03
+          alerts:
+            telegram_enabled: true
+            telegram_bot_token: "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+            telegram_chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          EOF
+      
+      - name: Send start notification
+        if: steps.check_day.outcome == 'success'
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="🚀 Trading bot started via GitHub Actions
+          📅 $(date +%Y-%m-%d)
+          ☁️ Running in cloud (FREE)"
+      
+      - name: Run trading bot
+        if: steps.check_day.outcome == 'success'
+        run: |
+          echo "Starting at $(date)"
+          python live_paper_v3.py --data-source yfinance
+          echo "Completed at $(date)"
+      
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_number }}
+          path: |
+            results/*.csv
+            logs/*.log
+          retention-days: 30
+      
+      - name: Send completion notification
+        if: always() && steps.check_day.outcome == 'success'
+        run: |
+          python -c "
+          import os
+          import urllib.request
+          import json
+          from datetime import date
+          from pathlib import Path
+          
+          token = '${{ secrets.TELEGRAM_BOT_TOKEN }}'
+          chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
+          
+          results_file = Path(f'results/live_v3_{date.today()}.csv')
+          if results_file.exists():
+            import pandas as pd
+            df = pd.read_csv(results_file)
+            trades = len(df)
+            pnl = df['net_pnl'].sum() if 'net_pnl' in df.columns else 0
+            wins = len(df[df['net_pnl'] > 0]) if 'net_pnl' in df.columns else 0
+            wr = wins/trades*100 if trades > 0 else 0
+            msg = f'📊 GitHub Actions Report\n📅 {date.today()}\n━━━━━━━━━━━━━━\n📋 Trades: {trades}\n✅ Win Rate: {wr:.0f}%\n💰 PnL: ₹{pnl:+,.0f}'
+          else:
+            msg = f'📊 {date.today()}\n📭 No trades today'
+          
+          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+          req = urllib.request.Request(
+            f'https://api.telegram.org/bot{token}/sendMessage',
+            data=data,
+            headers={'Content-Type': 'application/json'}
+          )
+          urllib.request.urlopen(req, timeout=10)
+          "
