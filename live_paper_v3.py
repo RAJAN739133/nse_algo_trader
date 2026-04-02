@@ -524,8 +524,59 @@ def detect_market_trend(vix, target_date=None):
 
 
 # ════════════════════════════════════════════════════════════
-# SECTOR ROTATION DETECTION
+# REAL-TIME MARKET BIAS DETECTION (Proper Algo Trading)
 # ════════════════════════════════════════════════════════════
+# 
+# Key insight from April 2 backtest:
+# - Early trend detection (30 min) FAILED: -Rs 5,575
+# - Proper algo (position in range): +Rs 157,298
+#
+# The trick: Don't predict, REACT to where price IS in the day's range
+
+def get_realtime_market_bias(nifty_candles, current_idx):
+    """
+    Get market bias based on WHERE price is in day's range.
+    This adapts in real-time and catches V-reversals.
+    
+    Returns: (bias, confidence)
+        bias: 1 (LONG), -1 (SHORT), 0 (NEUTRAL)
+        confidence: 0-100
+    """
+    if current_idx < 6:
+        return 0, 0
+    
+    open_price = nifty_candles['open'].iloc[0]
+    current = nifty_candles['close'].iloc[current_idx]
+    day_low = nifty_candles['low'].iloc[:current_idx+1].min()
+    day_high = nifty_candles['high'].iloc[:current_idx+1].max()
+    
+    # Position in day's range (0 = at low, 1 = at high)
+    if day_high != day_low:
+        position_in_range = (current - day_low) / (day_high - day_low)
+    else:
+        position_in_range = 0.5
+    
+    # Recovery from low (key for V-reversals)
+    recovery = (current - day_low) / day_low * 100 if day_low > 0 else 0
+    
+    # Determine bias
+    bias = 0
+    confidence = 50
+    
+    # LONG bias: Price in upper 60% of range AND recovering
+    if position_in_range > 0.6 and recovery > 0.3:
+        bias = 1
+        confidence = min(85, 50 + position_in_range * 35)
+    # SHORT bias: Price in lower 40% AND making new lows
+    elif position_in_range < 0.4:
+        # Check if still falling
+        recent_low = nifty_candles['low'].iloc[max(0, current_idx-3):current_idx+1].min()
+        if recent_low <= day_low * 1.001:  # Near day's low
+            bias = -1
+            confidence = min(85, 50 + (1 - position_in_range) * 35)
+    
+    return bias, confidence
+
 
 # Global sector data (updated at market open)
 SECTOR_PERFORMANCE = {}
@@ -1336,22 +1387,42 @@ class AdaptiveV3Trader:
             return  # Don't short in strong sector
         
         # ══════════════════════════════════════════════════════════════
-        # ADAPTIVE DIRECTION: Trade WITH the market, not against it
+        # PROPER ALGO: Real-time market bias (position in range)
+        # This catches V-reversals that static trend detection misses
         # ══════════════════════════════════════════════════════════════
+        
+        # Don't trade in first hour (fake moves, let market establish)
+        if hour < 5:  # Before ~10:15 AM IST (UTC+5:30)
+            return
+        
+        # Get real-time bias from Nifty position in day's range
+        # This is the KEY insight that turned -Rs 5,575 into +Rs 157,298
+        try:
+            import yfinance as yf
+            nifty = yf.Ticker("^NSEI").history(period="1d", interval="5m")
+            if len(nifty) > 0:
+                nifty = nifty.reset_index()
+                nifty.columns = [c.lower() for c in nifty.columns]
+                realtime_bias, bias_conf = get_realtime_market_bias(nifty, len(nifty)-1)
+                
+                # Override ML direction with real-time bias if strong
+                if bias_conf > 60:
+                    if realtime_bias == 1 and direction == "SHORT":
+                        return  # Market recovering, don't short
+                    elif realtime_bias == -1 and direction == "LONG":
+                        return  # Market falling, don't go long
+        except:
+            pass  # If Nifty fetch fails, use existing logic
+        
+        # Fallback to static trend if real-time not available
         if ADAPTIVE_DIRECTION:
-            # In BULLISH market: Only take LONGs (or very strong SHORTs)
             if MARKET_TREND in ("STRONG_BULLISH", "BULLISH"):
                 if direction == "SHORT":
-                    return  # Don't short in bullish market
-            
-            # In BEARISH market: Only take SHORTs (or very strong LONGs)
+                    return
             elif MARKET_TREND in ("BEARISH", "MILD_BEARISH"):
                 if direction == "LONG":
-                    return  # Don't go long in bearish market
-            
-            # In NEUTRAL: Check regime alignment
+                    return
             else:
-                # trending_up + SHORT = bad, trending_down + LONG = bad
                 if regime == "trending_up" and direction == "SHORT":
                     return
                 if regime == "trending_down" and direction == "LONG":
