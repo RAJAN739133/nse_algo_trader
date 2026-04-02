@@ -65,6 +65,13 @@ class ProStrategyV2:
         self.base_rr_ratio = 2.0  # 2:1 RR
         self.high_vol_rr_ratio = 2.5  # Higher in volatile
         
+        # ══════════════════════════════════════════════════════════
+        # TRAILING STOP SETTINGS (NEW - catches bigger moves)
+        # ══════════════════════════════════════════════════════════
+        self.trailing_enabled = True
+        self.trailing_activation_pct = 0.005  # Activate trailing after 0.5% profit
+        self.trailing_stop_pct = 0.003  # Trail 0.3% behind price
+        
         # Removed filters (were killing trades)
         self.max_gap_pct = 0.03  # Relaxed from 1.5% to 3%
         self.max_orb_to_adr_ratio = 0.80  # Relaxed from 60%

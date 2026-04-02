@@ -2,15 +2,9 @@ name: NSE Algo Trader
 
 on:
   schedule:
-    # Run at 9:00 AM IST (3:30 AM UTC) Monday-Friday
-    - cron: '30 3 * * 1-5'
+    - cron: '30 3 * * 1-5'  # 9:00 AM IST Mon-Fri
   
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Run mode'
-        required: false
-        default: 'live'
 
 jobs:
   trade:
@@ -35,7 +29,7 @@ jobs:
       - name: Check if trading day
         id: check_day
         run: |
-          python -c "
+          python << 'EOF'
           from datetime import date
           import sys
           
@@ -48,20 +42,20 @@ jobs:
           
           today = date.today()
           if today.weekday() >= 5:
-            print('Weekend')
-            sys.exit(1)
-          if str(today) in holidays:
-            print('Holiday')
-            sys.exit(1)
-          print(f'Trading day: {today}')
-          "
-        continue-on-error: true
+            print(f'SKIP: Weekend ({today})')
+            print('is_trading_day=false')
+          elif str(today) in holidays:
+            print(f'SKIP: Holiday ({today})')
+            print('is_trading_day=false')
+          else:
+            print(f'Trading day: {today}')
+            print('is_trading_day=true')
+          EOF
       
-      - name: Setup config from secrets
-        if: steps.check_day.outcome == 'success'
+      - name: Setup config
         run: |
-          mkdir -p config
-          cat > config/angel_config.yaml << 'EOF'
+          mkdir -p config logs results
+          cat > config/angel_config.yaml << EOF
           angel_one:
             api_key: "${{ secrets.ANGEL_API_KEY }}"
             client_code: "${{ secrets.ANGEL_CLIENT_CODE }}"
@@ -69,7 +63,7 @@ jobs:
             totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
           EOF
           
-          cat > config/config_prod.yaml << 'EOF'
+          cat > config/config_prod.yaml << EOF
           capital:
             total: 100000
             risk_per_trade: 0.01
@@ -84,21 +78,86 @@ jobs:
             api_key: "${{ secrets.ANTHROPIC_API_KEY }}"
           EOF
       
-      - name: Send start notification
-        if: steps.check_day.outcome == 'success'
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="🚀 Trading bot started via GitHub Actions
-          📅 $(date +%Y-%m-%d)
-          ☁️ Running in cloud (FREE)"
-      
       - name: Run trading bot
-        if: steps.check_day.outcome == 'success'
         run: |
-          echo "Starting at $(date)"
-          python live_paper_v3.py --universe nifty50 --top 10
-          echo "Completed at $(date)"
+          python << 'EOF'
+          from datetime import date
+          import subprocess
+          import sys
+          
+          holidays = {
+            '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31',
+            '2026-04-03', '2026-04-14', '2026-05-01', '2026-05-28',
+            '2026-06-26', '2026-08-19', '2026-10-02', '2026-10-20',
+            '2026-10-22', '2026-11-05', '2026-12-25'
+          }
+          
+          today = date.today()
+          is_trading = today.weekday() < 5 and str(today) not in holidays
+          
+          if not is_trading:
+            print(f"📅 {today} - Market closed (weekend/holiday)")
+            print("✅ Skipping trading - this is expected behavior")
+            sys.exit(0)  # Exit successfully
+          
+          print(f"🚀 Starting trading for {today}")
+          result = subprocess.run(
+            ["python", "live_paper_v3.py", "--universe", "nifty50", "--top", "10"],
+            capture_output=False
+          )
+          sys.exit(result.returncode)
+          EOF
+      
+      - name: Send Telegram notification
+        if: always()
+        run: |
+          python << 'EOF'
+          import os
+          import urllib.request
+          import json
+          from datetime import date
+          from pathlib import Path
+          
+          token = os.environ.get('TG_TOKEN', '')
+          chat_id = os.environ.get('TG_CHAT', '')
+          
+          if not token or not chat_id:
+            print("Telegram not configured")
+            exit(0)
+          
+          today = date.today()
+          holidays = {'2026-04-03'}  # Add more as needed
+          
+          if today.weekday() >= 5 or str(today) in holidays:
+            msg = f"📅 {today}\n🚫 Market closed\n✅ Bot checked and skipped correctly"
+          else:
+            results_file = Path(f'results/live_v3_{today}.csv')
+            if results_file.exists():
+              import pandas as pd
+              df = pd.read_csv(results_file)
+              trades = len(df)
+              pnl = df['net_pnl'].sum() if 'net_pnl' in df.columns else 0
+              wins = len(df[df['net_pnl'] > 0]) if 'net_pnl' in df.columns else 0
+              wr = wins/trades*100 if trades > 0 else 0
+              msg = f"📊 Trading Report\n📅 {today}\n━━━━━━━━━━━━\n📋 Trades: {trades}\n✅ Win Rate: {wr:.0f}%\n💰 PnL: ₹{pnl:+,.0f}"
+            else:
+              msg = f"📊 {today}\n📭 No trades today"
+          
+          try:
+            data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+            req = urllib.request.Request(
+              f'https://api.telegram.org/bot{token}/sendMessage',
+              data=data,
+              headers={'Content-Type': 'application/json'}
+            )
+            urllib.request.urlopen(req, timeout=10)
+            print("Notification sent")
+          except Exception as e:
+            print(f"Notification failed: {e}")
+          EOF
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
       
       - name: Upload results
         if: always()
@@ -106,40 +165,7 @@ jobs:
         with:
           name: results-${{ github.run_number }}
           path: |
-            results/*.csv
-            logs/*.log
+            results/
+            logs/
           retention-days: 30
-      
-      - name: Send completion notification
-        if: always() && steps.check_day.outcome == 'success'
-        run: |
-          python -c "
-          import os
-          import urllib.request
-          import json
-          from datetime import date
-          from pathlib import Path
-          
-          token = '${{ secrets.TELEGRAM_BOT_TOKEN }}'
-          chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
-          
-          results_file = Path(f'results/live_v3_{date.today()}.csv')
-          if results_file.exists():
-            import pandas as pd
-            df = pd.read_csv(results_file)
-            trades = len(df)
-            pnl = df['net_pnl'].sum() if 'net_pnl' in df.columns else 0
-            wins = len(df[df['net_pnl'] > 0]) if 'net_pnl' in df.columns else 0
-            wr = wins/trades*100 if trades > 0 else 0
-            msg = f'📊 GitHub Actions Report\n📅 {date.today()}\n━━━━━━━━━━━━━━\n📋 Trades: {trades}\n✅ Win Rate: {wr:.0f}%\n💰 PnL: ₹{pnl:+,.0f}'
-          else:
-            msg = f'📊 {date.today()}\n📭 No trades today'
-          
-          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
-          req = urllib.request.Request(
-            f'https://api.telegram.org/bot{token}/sendMessage',
-            data=data,
-            headers={'Content-Type': 'application/json'}
-          )
-          urllib.request.urlopen(req, timeout=10)
-          "
+          if-no-files-found: ignore

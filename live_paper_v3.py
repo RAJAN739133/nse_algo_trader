@@ -1314,14 +1314,23 @@ class AdaptiveV3Trader:
                     if partial < self.shares:
                         self._close_trade(c, t, "PARTIAL_EXIT", shares_to_close=partial)
             
-            # Breakeven trail (move SL to entry when in profit by 1R)
-            # This is safer than hard stop - prevents full loss
-            unrealised = c - self.entry_price
-            initial_risk = self.entry_price - self.sl
-            if initial_risk > 0 and unrealised >= initial_risk and not self.sl_moved_to_be:
-                self.sl = self.entry_price + 0.10
+            # ══════════════════════════════════════════════════════════
+            # TRAILING STOP: Lock in profits as price moves up
+            # ══════════════════════════════════════════════════════════
+            unrealised_pct = (c - self.entry_price) / self.entry_price
+            
+            # Stage 1: Move to breakeven after 0.5% profit
+            if unrealised_pct >= 0.005 and not self.sl_moved_to_be:
+                self.sl = self.entry_price + 0.10  # Just above entry
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
+            
+            # Stage 2: Trail stop 0.3% behind price after 0.7% profit
+            if unrealised_pct >= 0.007:
+                new_sl = c * 0.997  # 0.3% below current price
+                if new_sl > self.sl:
+                    self.sl = new_sl
+                    logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
         
         else:  # SHORT
             # BACKTEST INSIGHT: Stop losses were 100% losers
@@ -1342,12 +1351,23 @@ class AdaptiveV3Trader:
                     if partial < self.shares:
                         self._close_trade(c, t, "PARTIAL_EXIT", shares_to_close=partial)
             
-            unrealised = self.entry_price - c
-            initial_risk = self.sl - self.entry_price
-            if initial_risk > 0 and unrealised >= initial_risk and not self.sl_moved_to_be:
-                self.sl = self.entry_price - 0.10
+            # ══════════════════════════════════════════════════════════
+            # TRAILING STOP: Lock in profits as price moves down (SHORT)
+            # ══════════════════════════════════════════════════════════
+            unrealised_pct = (self.entry_price - c) / self.entry_price
+            
+            # Stage 1: Move to breakeven after 0.5% profit
+            if unrealised_pct >= 0.005 and not self.sl_moved_to_be:
+                self.sl = self.entry_price - 0.10  # Just below entry
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
+            
+            # Stage 2: Trail stop 0.3% above price after 0.7% profit
+            if unrealised_pct >= 0.007:
+                new_sl = c * 1.003  # 0.3% above current price
+                if new_sl < self.sl:
+                    self.sl = new_sl
+                    logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
 
     def _scan_for_entry(self, candles, i):
         """
