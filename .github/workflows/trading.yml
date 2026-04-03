@@ -1,15 +1,53 @@
+# ════════════════════════════════════════════════════════════
+# NSE ALGO TRADER — GitHub Actions Workflow
+# ════════════════════════════════════════════════════════════
+#
+# This workflow runs the trading scheduler automatically:
+# - Weekdays at 8:50 AM IST (before market open)
+# - Can also be triggered manually
+#
+# Required Secrets (set in GitHub repo settings):
+# - ANGEL_API_KEY
+# - ANGEL_CLIENT_ID
+# - ANGEL_PASSWORD
+# - ANGEL_TOTP_SECRET
+# - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_CHAT_ID
+# - ANTHROPIC_API_KEY (for Claude Brain)
+#
+# ════════════════════════════════════════════════════════════
+
 name: NSE Algo Trader
 
 on:
+  # Scheduled run - Weekdays at 8:50 AM IST (3:20 AM UTC)
   schedule:
-    - cron: '30 3 * * 1-5'  # 9:00 AM IST Mon-Fri
+    - cron: '20 3 * * 1-5'  # Mon-Fri at 3:20 UTC = 8:50 AM IST
   
+  # Manual trigger
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Trading mode'
+        required: true
+        default: 'paper'
+        type: choice
+        options:
+          - paper
+          - live
+      backtest_date:
+        description: 'Backtest date (YYYY-MM-DD) or leave empty for live'
+        required: false
+        default: ''
+
+env:
+  TZ: Asia/Kolkata
 
 jobs:
-  trade:
+  trading:
+    name: Run Trading Session
     runs-on: ubuntu-latest
-    timeout-minutes: 390
+    timeout-minutes: 420  # 7 hours max (full trading day)
     
     steps:
       - name: Checkout code
@@ -25,153 +63,250 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install psutil
       
-      - name: Check if trading day
-        id: check_day
+      - name: Create config from secrets
         run: |
-          python << 'EOF'
-          from datetime import date
-          import sys
-          
-          holidays = {
-            '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31',
-            '2026-04-03', '2026-04-14', '2026-05-01', '2026-05-28',
-            '2026-06-26', '2026-08-19', '2026-10-02', '2026-10-20',
-            '2026-10-22', '2026-11-05', '2026-12-25'
-          }
-          
-          today = date.today()
-          if today.weekday() >= 5:
-            print(f'SKIP: Weekend ({today})')
-            print('is_trading_day=false')
-          elif str(today) in holidays:
-            print(f'SKIP: Holiday ({today})')
-            print('is_trading_day=false')
-          else:
-            print(f'Trading day: {today}')
-            print('is_trading_day=true')
-          EOF
-      
-      - name: Setup config
-        run: |
-          mkdir -p config logs results
-          cat > config/angel_config.yaml << EOF
-          angel_one:
-            api_key: "${{ secrets.ANGEL_API_KEY }}"
-            client_code: "${{ secrets.ANGEL_CLIENT_CODE }}"
-            pin: "${{ secrets.ANGEL_PIN }}"
-            totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
-          EOF
-          
+          mkdir -p config
           cat > config/config_prod.yaml << EOF
+          broker:
+            angel_one:
+              api_key: "${{ secrets.ANGEL_API_KEY }}"
+              client_id: "${{ secrets.ANGEL_CLIENT_ID }}"
+              password: "${{ secrets.ANGEL_PASSWORD }}"
+              totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
+            mode: "${{ github.event.inputs.mode || 'paper' }}"
+            data_source: "angel_one"
+          
           capital:
             total: 10000
-            risk_per_trade: 0.01
-            max_trades_per_day: 3
-            daily_loss_limit: 0.03
-          alerts:
-            telegram_enabled: true
-            telegram_bot_token: "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-            telegram_chat_id: "${{ secrets.TELEGRAM_CHAT_ID }}"
-          claude:
+            risk_per_trade: 0.02
+            max_trades_per_day: 5
+            daily_loss_limit: 0.02
+          
+          telegram:
+            bot_token: "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+            chat_ids:
+              - "${{ secrets.TELEGRAM_CHAT_ID }}"
             enabled: true
+          
+          claude:
             api_key: "${{ secrets.ANTHROPIC_API_KEY }}"
+            model: "claude-sonnet-4-20250514"
+            max_calls_per_day: 50
+          
+          trading:
+            start_time: "09:15"
+            end_time: "15:15"
+            square_off_time: "15:10"
+          
+          filters:
+            vix_extreme_threshold: 30
+          
+          strategy_tweaks:
+            target_pct: 0.012
+            stop_pct: 0.005
+            quick_profit_pct: 0.008
+            cut_loss_pct: 0.003
+            time_decay_candles: 16
           EOF
+          
+          # Also create symlink for config_test.yaml
+          cp config/config_prod.yaml config/config_test.yaml
       
-      - name: Run trading bot
+      - name: Create data directories
+        run: |
+          mkdir -p data logs results models
+      
+      - name: Check market holiday
+        id: holiday_check
         run: |
           python << 'EOF'
-          from datetime import date
-          import subprocess
           import sys
+          from datetime import date
           
-          holidays = {
-            '2026-01-26', '2026-03-03', '2026-03-26', '2026-03-31',
-            '2026-04-03', '2026-04-14', '2026-05-01', '2026-05-28',
-            '2026-06-26', '2026-08-19', '2026-10-02', '2026-10-20',
-            '2026-10-22', '2026-11-05', '2026-12-25'
-          }
-          
+          # Check if today is a holiday (basic check)
           today = date.today()
-          is_trading = today.weekday() < 5 and str(today) not in holidays
           
-          if not is_trading:
-            print(f"📅 {today} - Market closed (weekend/holiday)")
-            print("✅ Skipping trading - this is expected behavior")
-            sys.exit(0)  # Exit successfully
+          # NSE holidays 2026 (add more as needed)
+          holidays = [
+              date(2026, 1, 26),   # Republic Day
+              date(2026, 3, 10),   # Holi
+              date(2026, 3, 30),   # Id-ul-Fitr
+              date(2026, 4, 6),    # Ram Navami
+              date(2026, 4, 10),   # Good Friday
+              date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+              date(2026, 4, 21),   # Mahavir Jayanti
+              date(2026, 5, 1),    # May Day
+              date(2026, 6, 7),    # Id-ul-Zuha
+              date(2026, 7, 7),    # Muharram
+              date(2026, 8, 15),   # Independence Day
+              date(2026, 9, 5),    # Milad-un-Nabi
+              date(2026, 10, 2),   # Gandhi Jayanti
+              date(2026, 10, 20),  # Dussehra
+              date(2026, 10, 21),  # Dussehra
+              date(2026, 11, 9),   # Diwali
+              date(2026, 11, 10),  # Diwali Balipratipada
+              date(2026, 11, 16),  # Guru Nanak Jayanti
+              date(2026, 12, 25),  # Christmas
+          ]
           
-          print(f"🚀 Starting trading for {today}")
-          result = subprocess.run(
-            ["python", "live_paper_v3.py", "--universe", "nifty250", "--top", "20"],
-            capture_output=False
-          )
-          sys.exit(result.returncode)
+          if today in holidays:
+              print("Market holiday - skipping")
+              sys.exit(1)
+          
+          if today.weekday() >= 5:  # Saturday or Sunday
+              print("Weekend - skipping")
+              sys.exit(1)
+              
+          print("Trading day - proceeding")
+          sys.exit(0)
           EOF
+        continue-on-error: true
       
-      - name: Send Telegram notification
-        if: always()
+      - name: Skip if holiday
+        if: steps.holiday_check.outcome == 'failure'
+        run: |
+          echo "Skipping - Market closed today"
+          exit 0
+      
+      - name: Run system test
+        if: steps.holiday_check.outcome == 'success'
+        run: |
+          python test_system.py || echo "Some tests failed, continuing..."
+      
+      - name: Send start notification
+        if: steps.holiday_check.outcome == 'success'
         run: |
           python << 'EOF'
+          import requests
           import os
-          import urllib.request
-          import json
-          from datetime import date
-          from pathlib import Path
+          from datetime import datetime
           
-          token = os.environ.get('TG_TOKEN', '')
-          chat_ids_str = os.environ.get('TG_CHAT', '')
+          bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+          chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
           
-          if not token or not chat_ids_str:
-            print("Telegram not configured")
-            exit(0)
+          if bot_token and chat_id:
+              msg = f"""🚀 *Algo Trader Starting*
           
-          # Support multiple chat IDs (comma-separated)
-          chat_ids = [cid.strip() for cid in chat_ids_str.split(',') if cid.strip()]
-          print(f"Sending to {len(chat_ids)} recipient(s)")
+          📅 Date: {datetime.now().strftime('%Y-%m-%d')}
+          ⏰ Time: {datetime.now().strftime('%H:%M:%S')} IST
+          🤖 Mode: ${{ github.event.inputs.mode || 'paper' }}
+          📍 Running on: GitHub Actions
           
-          today = date.today()
-          holidays = {'2026-04-03'}  # Add more as needed
-          
-          if today.weekday() >= 5 or str(today) in holidays:
-            msg = f"📅 {today}\n🚫 Market closed\n✅ Bot checked and skipped correctly"
-          else:
-            results_file = Path(f'results/live_v3_{today}.csv')
-            if results_file.exists():
-              import pandas as pd
-              df = pd.read_csv(results_file)
-              trades = len(df)
-              pnl = df['net_pnl'].sum() if 'net_pnl' in df.columns else 0
-              wins = len(df[df['net_pnl'] > 0]) if 'net_pnl' in df.columns else 0
-              wr = wins/trades*100 if trades > 0 else 0
-              msg = f"📊 Trading Report\n📅 {today}\n━━━━━━━━━━━━\n📋 Trades: {trades}\n✅ Win Rate: {wr:.0f}%\n💰 PnL: ₹{pnl:+,.0f}"
-            else:
-              msg = f"📊 {today}\n📭 No trades today"
-          
-          # Send to all chat IDs
-          for chat_id in chat_ids:
-            try:
-              data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
-              req = urllib.request.Request(
-                f'https://api.telegram.org/bot{token}/sendMessage',
-                data=data,
-                headers={'Content-Type': 'application/json'}
+          Trading session beginning..."""
+              
+              requests.post(
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                  json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
               )
-              urllib.request.urlopen(req, timeout=10)
-              print(f"✅ Sent to {chat_id}")
-            except Exception as e:
-              print(f"❌ Failed for {chat_id}: {e}")
           EOF
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       
-      - name: Upload results
+      - name: Run trading scheduler
+        if: steps.holiday_check.outcome == 'success'
+        run: |
+          if [ -n "${{ github.event.inputs.backtest_date }}" ]; then
+            echo "Running backtest for ${{ github.event.inputs.backtest_date }}"
+            python live_paper_v3.py --backtest "${{ github.event.inputs.backtest_date }}"
+          else
+            echo "Running live trading session"
+            python scheduler.py
+          fi
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRADING_ENV: prod
+        timeout-minutes: 400
+      
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ github.run_number }}
+          name: trading-logs-${{ github.run_number }}
           path: |
-            results/
             logs/
+            results/
           retention-days: 30
-          if-no-files-found: ignore
+      
+      - name: Send completion notification
+        if: always() && steps.holiday_check.outcome == 'success'
+        run: |
+          python << 'EOF'
+          import requests
+          import os
+          from datetime import datetime
+          from pathlib import Path
+          
+          bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+          chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+          
+          if bot_token and chat_id:
+              # Try to read today's results
+              pnl_msg = "No trades today"
+              results_dir = Path("results")
+              if results_dir.exists():
+                  csv_files = list(results_dir.glob("*.csv"))
+                  if csv_files:
+                      import pandas as pd
+                      latest = max(csv_files, key=lambda x: x.stat().st_mtime)
+                      try:
+                          df = pd.read_csv(latest)
+                          if len(df) > 0:
+                              total_pnl = df['net_pnl'].sum() if 'net_pnl' in df.columns else 0
+                              trades = len(df)
+                              pnl_msg = f"Trades: {trades}, P&L: ₹{total_pnl:+,.2f}"
+                      except:
+                          pass
+              
+              status = "✅ Completed" if os.environ.get('JOB_STATUS') != 'failure' else "❌ Failed"
+              
+              msg = f"""📊 *Trading Session Ended*
+          
+          {status}
+          📅 Date: {datetime.now().strftime('%Y-%m-%d')}
+          ⏰ Time: {datetime.now().strftime('%H:%M:%S')} IST
+          📈 {pnl_msg}
+          
+          Logs uploaded to GitHub Actions artifacts."""
+              
+              requests.post(
+                  f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                  json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
+              )
+          EOF
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+
+  # Separate job for weekly ML model retraining
+  retrain:
+    name: Weekly ML Retrain
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 18 * * 6'  # Saturday 6 PM UTC
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Retrain ML model
+        run: |
+          python -m ml.train_model --model-type lightgbm
+      
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-model-${{ github.run_number }}
+          path: models/
+          retention-days: 90

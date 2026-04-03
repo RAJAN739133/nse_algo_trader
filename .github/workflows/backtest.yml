@@ -1,0 +1,99 @@
+# ════════════════════════════════════════════════════════════
+# NSE ALGO TRADER — Backtest Workflow
+# ════════════════════════════════════════════════════════════
+#
+# Run backtests on demand to validate strategy changes
+#
+# ════════════════════════════════════════════════════════════
+
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Number of days to backtest'
+        required: true
+        default: '30'
+        type: choice
+        options:
+          - '7'
+          - '14'
+          - '30'
+          - '60'
+          - '90'
+      capital:
+        description: 'Initial capital (Rs)'
+        required: true
+        default: '10000'
+
+jobs:
+  backtest:
+    name: Run Backtest
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Create minimal config
+        run: |
+          mkdir -p config data results
+          cat > config/config_test.yaml << EOF
+          capital:
+            total: ${{ github.event.inputs.capital }}
+            risk_per_trade: 0.02
+          broker:
+            mode: paper
+          EOF
+      
+      - name: Run backtest
+        run: |
+          echo "Running ${{ github.event.inputs.days }}-day backtest with Rs ${{ github.event.inputs.capital }} capital"
+          python backtest_daily.py --days ${{ github.event.inputs.days }} --capital ${{ github.event.inputs.capital }}
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.event.inputs.days }}d-${{ github.run_number }}
+          path: results/
+          retention-days: 30
+      
+      - name: Post results summary
+        run: |
+          echo "## Backtest Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Period:** ${{ github.event.inputs.days }} days" >> $GITHUB_STEP_SUMMARY
+          echo "- **Capital:** Rs ${{ github.event.inputs.capital }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f results/backtest_daily.csv ]; then
+            echo "### Trade Summary" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            python << 'EOF' >> $GITHUB_STEP_SUMMARY
+          import pandas as pd
+          df = pd.read_csv('results/backtest_daily.csv')
+          if len(df) > 0:
+              total_pnl = df['net_pnl'].sum()
+              winners = (df['net_pnl'] > 0).sum()
+              total = len(df)
+              win_rate = winners / total * 100 if total > 0 else 0
+              print(f"Total Trades: {total}")
+              print(f"Winners: {winners} ({win_rate:.1f}%)")
+              print(f"Net P&L: Rs {total_pnl:+,.2f}")
+          else:
+              print("No trades executed")
+          EOF
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
