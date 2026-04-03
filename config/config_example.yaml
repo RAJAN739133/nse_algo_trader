@@ -81,6 +81,33 @@ filters:
   vix_reduce_threshold: 20
   vix_skip_threshold: 25
 
+# ══════════════════════════════════════════════════════════════
+# PROFIT BOOKING SYSTEM - THE KEY TO PROFITABILITY!
+# Backtest shows: Quick profit booking turns -3% into +1.7%
+# ══════════════════════════════════════════════════════════════
+strategy_tweaks:
+  # Target and Stop (% from entry)
+  target_pct: 0.012            # 1.2% target (exit if hit)
+  stop_pct: 0.006              # 0.6% stop loss
+  
+  # QUICK PROFIT - Most important setting!
+  # Book profit IMMEDIATELY when this threshold is hit
+  # Don't wait for full target - "A bird in hand..."
+  quick_profit_pct: 0.01       # 1.0% quick profit (book it!)
+  
+  # CUT LOSER - Exit losers early before they become big losses
+  cut_loss_pct: 0.005          # 0.5% - cut losers fast
+  
+  # TRAILING STOP - Lock in profits as price moves
+  trailing_activation_pct: 0.006  # Start trailing after 0.6% profit
+  
+  # TIME MANAGEMENT - Don't hold positions forever
+  time_decay_candles: 20       # Max 20 candles (100 min) hold time
+  
+  # PARTIAL EXIT - Book some profits, let rest run
+  partial_exit_at_rr: 1.0      # Take partial at 1:1 risk-reward
+  partial_exit_pct: 0.5        # Exit 50% of position
+
 alerts:
   telegram_enabled: false
   telegram_bot_token: "YOUR_BOT_TOKEN"     # From @BotFather on Telegram

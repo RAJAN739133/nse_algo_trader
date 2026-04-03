@@ -31,3 +31,4 @@ anthropic>=0.18.0
 
 # Additional analytics
 statsmodels>=0.14.0
+psutil

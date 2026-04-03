@@ -1,0 +1,57 @@
+# ════════════════════════════════════════════════════════════
+# NSE ALGO TRADER — Systemd Service File
+# ════════════════════════════════════════════════════════════
+#
+# Installation:
+#   sudo cp nse_algo_trader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable nse_algo_trader
+#   sudo systemctl start nse_algo_trader
+#
+# Commands:
+#   sudo systemctl status nse_algo_trader  # Check status
+#   sudo systemctl stop nse_algo_trader    # Stop trading
+#   sudo systemctl restart nse_algo_trader # Restart
+#   journalctl -u nse_algo_trader -f       # View logs
+#
+# ════════════════════════════════════════════════════════════
+
+[Unit]
+Description=NSE Algorithmic Trading Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rajananand
+Group=rajananand
+WorkingDirectory=/Users/rajananand/Downloads/nse_algo_trader
+
+# Environment
+Environment="PATH=/Users/rajananand/Downloads/nse_algo_trader/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/Users/rajananand/Downloads/nse_algo_trader"
+Environment="TRADING_ENV=prod"
+
+# Main process - Scheduler handles all trading lifecycle
+ExecStart=/Users/rajananand/Downloads/nse_algo_trader/.venv/bin/python scheduler.py
+
+# Restart policy
+Restart=always
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=append:/Users/rajananand/Downloads/nse_algo_trader/logs/service.log
+StandardError=append:/Users/rajananand/Downloads/nse_algo_trader/logs/service_error.log
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=50%
+
+# Graceful shutdown
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

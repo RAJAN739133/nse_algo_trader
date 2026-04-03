@@ -6,8 +6,56 @@ Sends you a message whenever the algo places an order, hits a stop, or breaches 
 import requests
 import logging
 from datetime import datetime
+from typing import Dict, Any, List, Union
 
 logger = logging.getLogger(__name__)
+
+
+def send_telegram(message: str, config: Dict[str, Any]) -> bool:
+    """
+    Send a Telegram message using config.
+    
+    Args:
+        message: The message to send
+        config: Config dict with telegram.bot_token and telegram.chat_ids
+        
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    tg_config = config.get("telegram", {})
+    bot_token = tg_config.get("bot_token")
+    chat_ids = tg_config.get("chat_ids", [])
+    
+    if not bot_token or not chat_ids:
+        logger.debug("Telegram not configured, skipping alert")
+        return False
+        
+    if isinstance(chat_ids, (int, str)):
+        chat_ids = [chat_ids]
+        
+    success = True
+    base_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    
+    for chat_id in chat_ids:
+        try:
+            resp = requests.post(
+                base_url,
+                json={
+                    "chat_id": str(chat_id),
+                    "text": message,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Telegram send failed: {resp.text}")
+                success = False
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
+            success = False
+            
+    return success
 
 
 class TelegramAlert:

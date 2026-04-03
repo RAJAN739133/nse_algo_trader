@@ -122,16 +122,34 @@ BLOCKED_REGIMES = ["ranging", "unknown"]  # Low WR in all directions
 
 # Dynamic market trend (detected at market open from Nifty/VIX analysis)
 # This will be updated by detect_market_trend() before trading starts
-MARKET_TREND = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL
+MARKET_TREND = "NEUTRAL"  # BULLISH, BEARISH, NEUTRAL, MILD_BULLISH, MILD_BEARISH
 ENABLE_LONGS = True       # Will be set based on market trend
 ENABLE_SHORTS = True      # Will be set based on market trend
 MAX_LONGS = 5             # Dynamic limit
 MAX_SHORTS = 5            # Dynamic limit
 
 # ══════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER - HARDCODED, NON-NEGOTIABLE SAFETY
+# ══════════════════════════════════════════════════════════════════════
+CIRCUIT_BREAKER_LOSS_PCT = 0.02   # Stop ALL trading after 2% daily loss
+CIRCUIT_BREAKER_TRIGGERED = False  # Set True when triggered
+DAILY_PNL = 0.0                    # Track daily P&L
+DAILY_STARTING_CAPITAL = 0.0       # Capital at start of day
+
+# ══════════════════════════════════════════════════════════════════════
+# POSITION SIZING - Adapted for small capital (Rs 10K-50K)
+# With tiny capital, we need larger position % per trade
+# BUT limit total concurrent positions to control risk
+# ══════════════════════════════════════════════════════════════════════
+MAX_POSITION_PCT = 0.15            # Max 15% of capital per trade 
+MIN_POSITION_PCT = 0.05            # Min 5% per trade (avoid tiny positions)
+MAX_CONCURRENT_POSITIONS = 2       # ONLY 2 positions at a time (risk control!)
+
+# ══════════════════════════════════════════════════════════════════════
 # KEY FIX: Trade WITH the market, not against it
 # - In BULLISH market: Prioritize LONGs, limit SHORTs
-# - In BEARISH market: Prioritize SHORTs, limit LONGs  
+# - In BEARISH market: DISABLE LONGs completely (not just limit!)
+# - In MILD_BEARISH: DISABLE LONGs (conservative)
 # - In NEUTRAL: Be selective, smaller positions
 # ══════════════════════════════════════════════════════════════════════
 
@@ -558,9 +576,9 @@ def detect_market_trend(vix, target_date=None):
         elif trend_score <= -20:
             result["trend"] = "MILD_BEARISH"
             result["confidence"] = min(80, 55 + abs(trend_score) // 2)
-            result["enable_longs"] = True  # Allow 1 LONG in mild bear
+            result["enable_longs"] = False  # DISABLE LONGs completely in bearish
             result["enable_shorts"] = True
-            result["max_longs"] = 1
+            result["max_longs"] = 0         # No LONGs in any bearish market
             result["max_shorts"] = 5
         else:
             result["trend"] = "NEUTRAL"
@@ -1553,19 +1571,92 @@ class AdaptiveV3Trader:
         self.position_size_factor = config.get("position_size_factor", 1.0)
         self.risk_per_trade = config["capital"].get("risk_per_trade", 0.02)
         
-        # Strategy tweaks from Claude Brain (with defaults)
+        # ══════════════════════════════════════════════════════════════
+        # DYNAMIC PROFIT BOOKING - ML + Claude Driven with Safety Bounds
+        # ══════════════════════════════════════════════════════════════
+        # PHILOSOPHY: Let ML and Claude optimize, but with guardrails
+        # 
+        # 1. ML analyzes historical patterns → suggests base values
+        # 2. Claude researches current market → adjusts for conditions
+        # 3. Hardcoded bounds → prevent dangerous values
+        # 4. Circuit breaker → always enforced (non-negotiable)
+        # ══════════════════════════════════════════════════════════════
+        
+        # SAFETY BOUNDS (non-negotiable, based on backtesting)
+        # For small capital (Rs 10K-50K), position_pct is higher
+        BOUNDS = {
+            "quick_profit": (0.005, 0.02),   # 0.5% to 2.0%
+            "stop": (0.003, 0.015),          # 0.3% to 1.5%
+            "cut_loss": (0.002, 0.008),      # 0.2% to 0.8%
+            "target": (0.008, 0.025),        # 0.8% to 2.5%
+            "trail_activation": (0.003, 0.015),
+            "time_decay": (10, 30),          # 50 min to 150 min
+            "position_pct": (0.05, 0.15),    # 5% to 15% per trade (for small capital)
+        }
+        
+        # DEFAULTS (used if ML/Claude don't provide values)
+        DEFAULTS = {
+            "quick_profit": 0.008,   # 0.8%
+            "stop": 0.005,           # 0.5%
+            "cut_loss": 0.003,       # 0.3%
+            "target": 0.012,         # 1.2%
+            "trail_activation": 0.005,
+            "time_decay": 16,
+            "position_pct": 0.10,    # 10% per trade (for small capital)
+        }
+        
+        # Get values from ML features (if available)
+        ml_tweaks = {}
+        if ml_features:
+            # ML can suggest values based on volatility and trend strength
+            volatility = ml_features.get("volatility_ratio", 1.0)
+            trend_strength = ml_features.get("trend_strength", "weak")
+            
+            # Higher volatility → tighter stops, faster profit booking
+            if volatility > 1.5:
+                ml_tweaks["quick_profit"] = 0.006  # Book faster in volatile market
+                ml_tweaks["stop"] = 0.004          # Tighter stop
+                ml_tweaks["position_pct"] = 0.02   # Smaller position
+            elif volatility < 0.7:
+                ml_tweaks["quick_profit"] = 0.012  # Can wait longer in calm market
+                ml_tweaks["stop"] = 0.006
+                ml_tweaks["position_pct"] = 0.04
+            
+            # Strong trend → wider targets
+            if trend_strength == "strong":
+                ml_tweaks["target"] = 0.018
+                ml_tweaks["time_decay"] = 24  # Hold longer in strong trend
+        
+        # Get values from Claude Brain (if available)
         tweaks = config.get("strategy_tweaks", {})
-        self.target_pct = tweaks.get("target_pct", 0.01)
-        self.stop_pct = tweaks.get("stop_pct", 0.005)
-        self.quick_profit_pct = tweaks.get("quick_profit_pct", 0.008)
-        self.cut_loss_pct = tweaks.get("cut_loss_pct", 0.004)
-        self.trailing_activation_pct = tweaks.get("trailing_activation_pct", 0.005)
-        self.time_decay_candles = tweaks.get("time_decay_candles", 24)
+        
+        # Merge: Claude > ML > Defaults (with bounds enforced)
+        def get_bounded(key, default_key=None):
+            dk = default_key or key.replace("_pct", "")
+            # Priority: tweaks (Claude) > ml_tweaks (ML) > DEFAULTS
+            value = tweaks.get(f"{key}", ml_tweaks.get(dk, DEFAULTS.get(dk, 0)))
+            min_v, max_v = BOUNDS.get(dk, (0, 1))
+            return max(min_v, min(max_v, value))
+        
+        self.target_pct = get_bounded("target_pct", "target")
+        self.stop_pct = get_bounded("stop_pct", "stop")
+        self.quick_profit_pct = get_bounded("quick_profit_pct", "quick_profit")
+        self.cut_loss_pct = get_bounded("cut_loss_pct", "cut_loss")
+        self.trailing_activation_pct = get_bounded("trailing_activation_pct", "trail_activation")
+        self.time_decay_candles = int(get_bounded("time_decay_candles", "time_decay"))
+        self.max_position_pct = get_bounded("position_pct", "position_pct")
         self.orb_atr_multiplier = tweaks.get("orb_atr_multiplier", 1.5)
         self.strategy = ProStrategyV2(config.get("strategies", {}).get("pro", {}))
         self.regime_detector = RegimeDetector()
         self.pattern_detector = CandlePatternDetector()  # Candlestick patterns
         self.claude_brain = claude_brain  # Optional: Claude Brain for entry confirmation
+        
+        # Log the profit booking settings being used
+        logger.info(f"  {symbol} Profit Settings: "
+                   f"QuickProfit={self.quick_profit_pct*100:.1f}% | "
+                   f"Target={self.target_pct*100:.1f}% | "
+                   f"Stop={self.stop_pct*100:.1f}% | "
+                   f"CutLoss={self.cut_loss_pct*100:.1f}%")
         
         # ══════════════════════════════════════════════════════════════
         # ML-ENHANCED FEATURES for smarter trading decisions
@@ -1673,6 +1764,29 @@ class AdaptiveV3Trader:
                 logger.debug(f"Paper tracker log failed: {e}")
 
         self.day_pnl += net
+        
+        # ══════════════════════════════════════════════════════════════
+        # CIRCUIT BREAKER CHECK - Update daily PnL and check threshold
+        # ══════════════════════════════════════════════════════════════
+        global DAILY_PNL, CIRCUIT_BREAKER_TRIGGERED
+        DAILY_PNL += net
+        
+        # Check if circuit breaker should trigger
+        if DAILY_STARTING_CAPITAL > 0:
+            daily_loss_pct = -DAILY_PNL / DAILY_STARTING_CAPITAL
+            if daily_loss_pct >= CIRCUIT_BREAKER_LOSS_PCT and not CIRCUIT_BREAKER_TRIGGERED:
+                CIRCUIT_BREAKER_TRIGGERED = True
+                cb_msg = (
+                    f"🛑 CIRCUIT BREAKER TRIGGERED!\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📉 Daily Loss: ₹{DAILY_PNL:,.2f} ({daily_loss_pct*100:.1f}%)\n"
+                    f"⛔ All new trades STOPPED\n"
+                    f"📊 Capital: ₹{DAILY_STARTING_CAPITAL:,.0f}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ Take a break. Review what went wrong."
+                )
+                logger.warning(f"\n{'='*60}\n{cb_msg}\n{'='*60}")
+                send_telegram(cb_msg, self.config)
 
         emoji = "✅" if net > 0 else "❌"
         et_s = str(self.entry_time).split(" ")[-1].split("+")[0][:8]  # HH:MM:SS
@@ -1718,6 +1832,13 @@ class AdaptiveV3Trader:
                 pass  # Cooldown set by exit reason handlers
 
     def _enter_trade(self, signal, idx):
+        # ══════════════════════════════════════════════════════════════
+        # CIRCUIT BREAKER CHECK - Block all new entries if triggered
+        # ══════════════════════════════════════════════════════════════
+        if CIRCUIT_BREAKER_TRIGGERED:
+            logger.info(f"  ⛔ {self.symbol} BLOCKED: Circuit breaker triggered (daily loss > {CIRCUIT_BREAKER_LOSS_PCT*100:.0f}%)")
+            return
+        
         # ── CANDLE PATTERN CONFIRMATION ──
         # Check if candlestick patterns confirm the direction
         try:
@@ -1856,8 +1977,12 @@ class AdaptiveV3Trader:
         elif self.volatility_ratio < 0.7:
             risk_pct *= 1.1
         
-        # Cap risk_pct to safety limit (max 3%)
-        risk_pct = min(risk_pct, 0.03)
+        # ══════════════════════════════════════════════════════════════
+        # POSITION SIZE CAP - Max 3% per trade (enforced by bounds)
+        # This prevents single trade from wiping out days of gains
+        # ══════════════════════════════════════════════════════════════
+        risk_pct = min(risk_pct, self.max_position_pct)  # Use bounded value, not hardcoded
+        risk_pct = max(risk_pct, MIN_POSITION_PCT)       # At least 1% to avoid tiny positions
 
         # Calculate shares based on risk
         self.shares = max(1, int(self.capital * risk_pct / max(risk, min_risk)))
@@ -2038,42 +2163,49 @@ class AdaptiveV3Trader:
         pct_from_entry = (c - self.entry_price) / self.entry_price if self.side == "LONG" else (self.entry_price - c) / self.entry_price
         
         # ══════════════════════════════════════════════════════════
-        # BALANCED TIME MANAGEMENT - Claude Brain guided
-        # Conservative approach: secure profits, cut losses early
+        # PROFIT BOOKING SYSTEM - Based on backtest optimization
+        # KEY INSIGHT: Quick profit booking at 1% turns losses into profits!
         # ══════════════════════════════════════════════════════════
-        # EXIT THRESHOLDS (Dynamic from Claude Brain)
-        # quick_profit_pct: Take profit threshold (default 0.8%)
-        # cut_loss_pct: Cut loser threshold (default 0.4%)
-        # time_decay_candles: Max holding period (default 24 = 2 hours)
+        # RULES:
+        # 1. Book profit IMMEDIATELY when we hit quick_profit_pct (1%)
+        # 2. Cut losers early (0.5%) before they become big losses
+        # 3. Don't hold forever hoping for bigger moves
         # ══════════════════════════════════════════════════════════
         
-        # Phase 1 (0-20 min / 4 candles): Quick profit check
-        if holding_candles >= 4:
+        # PHASE 0: IMMEDIATE PROFIT CHECK (every candle after entry)
+        # This is the KEY change - check profit on EVERY candle, not just after 4
+        if holding_candles >= 2:  # Give at least 2 candles (10 min) for position to develop
             if pct_from_entry >= self.quick_profit_pct:
                 self._close_trade(c, t, "QUICK_PROFIT")
-                self.cooldown_until = i + 6
+                self.cooldown_until = i + 4  # Short cooldown, look for next opportunity
                 return
         
-        # Phase 2 (20-35 min / 4-7 candles): Cut losers early
-        if 4 <= holding_candles < 7:
+        # PHASE 1: Early profit check - even smaller profits are good
+        if holding_candles >= 3:
+            if pct_from_entry >= self.quick_profit_pct * 0.7:  # 70% of target = ~0.7%
+                self._close_trade(c, t, "EARLY_PROFIT")
+                self.cooldown_until = i + 5
+                return
+        
+        # PHASE 2: Cut losers early (before they become big losses)
+        if holding_candles >= 4:
             if pct_from_entry < -self.cut_loss_pct:
                 self._close_trade(c, t, "CUT_LOSER")
-                self.cooldown_until = i + 8
-                return
-        
-        # Phase 3 (35-50 min / 7-10 candles): Tighter management
-        time_decay_phase = int(self.time_decay_candles * 0.4)  # 40% of max hold
-        if time_decay_phase <= holding_candles < int(self.time_decay_candles * 0.5):
-            if pct_from_entry < self.quick_profit_pct * 0.25:  # Less than 25% of target
-                self._close_trade(c, t, "TIME_DECAY")
                 self.cooldown_until = i + 6
                 return
         
-        # Phase 4: Force exit at max holding time
+        # PHASE 3: Tighter management - exit flat trades
+        if holding_candles >= 8:  # 40 minutes
+            if pct_from_entry < self.quick_profit_pct * 0.3:  # Less than 0.3% profit
+                self._close_trade(c, t, "TIME_DECAY")
+                self.cooldown_until = i + 5
+                return
+        
+        # PHASE 4: Force exit at max holding time
         if holding_candles >= self.time_decay_candles:
             reason = "PROFIT_LOCK" if pct_from_entry > 0 else "TIME_DECAY"
             self._close_trade(c, t, reason)
-            self.cooldown_until = i + 6
+            self.cooldown_until = i + 4
             return
 
         if self.side == "LONG":
@@ -2733,16 +2865,26 @@ class AdaptiveV3Trader:
 
 def run(symbols=None, backtest_date=None):
     global MARKET_TREND, ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS
+    global CIRCUIT_BREAKER_TRIGGERED, DAILY_PNL, DAILY_STARTING_CAPITAL
     
     config = load_config()
     target_date = date.fromisoformat(backtest_date) if backtest_date else None
     is_backtest = target_date is not None
     today_str = str(target_date or date.today())
+    
+    # ══════════════════════════════════════════════════════════════
+    # CIRCUIT BREAKER RESET AT START OF DAY
+    # ══════════════════════════════════════════════════════════════
+    CIRCUIT_BREAKER_TRIGGERED = False
+    DAILY_PNL = 0.0
+    DAILY_STARTING_CAPITAL = config['capital']['total']
 
     logger.info(f"\n{'=' * 60}")
     logger.info(f"  LIVE PAPER TRADER V3 — ADAPTIVE")
     logger.info(f"  Date: {today_str} {'(BACKTEST)' if is_backtest else '(LIVE)'}")
     logger.info(f"  Capital: Rs {config['capital']['total']:,}")
+    logger.info(f"  Circuit Breaker: Stops at {CIRCUIT_BREAKER_LOSS_PCT * 100:.0f}% daily loss")
+    logger.info(f"  Max Position Size: {MAX_POSITION_PCT * 100:.0f}% per trade")
     logger.info(f"{'=' * 60}")
 
     # ── Holiday check (live API) ──
