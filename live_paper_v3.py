@@ -113,7 +113,7 @@ EMERGENCY_STOP_LOSS_PCT = 0.05  # 5% HARD STOP - protects against flash crashes
 
 # Strategy filters (disable losing strategies)
 DISABLE_PULLBACK = True      # 29-43% WR - losing strategy
-DISABLE_VWAP = True          # 33% WR for VWAP_SHORT, VWAP_LONG similar
+DISABLE_VWAP = False         # FIXED: Now uses 2σ + RSI + MACD + volume spike
 ADAPTIVE_DIRECTION = True    # Follow market trend - trade WITH the market
 
 # Regime filters (trade in favorable regimes only)
@@ -149,6 +149,77 @@ def get_dynamic_filters():
     scores = {sym: tracker.get_stock_score(sym) for sym in tracker.stats.keys()}
     
     return avoid, prefer, scores
+
+
+def get_ml_strategy_recommendation(stock_features, regime):
+    """
+    Use ML features to recommend the best strategy for a stock.
+    
+    Args:
+        stock_features: dict with ML features (atr_pct, adx, rsi, momentum, etc.)
+        regime: current market regime (trending_up, trending_down, ranging, etc.)
+    
+    Returns:
+        dict with recommended strategies and confidence
+    """
+    atr_pct = stock_features.get("atr_pct", 0.02)
+    adx = stock_features.get("adx", 25)
+    rsi = stock_features.get("rsi", 50)
+    ml_confidence = stock_features.get("ml_confidence", 0.0)
+    volatility_ratio = stock_features.get("volatility_ratio", 1.0)
+    
+    recommendations = {
+        "primary_strategy": None,
+        "secondary_strategy": None,
+        "avoid_strategies": [],
+        "confidence": 50,
+        "reasoning": "",
+    }
+    
+    # High ADX (> 25) + trending regime = momentum/trend strategies
+    if adx > 25 and regime in ("trending_up", "trending_down"):
+        recommendations["primary_strategy"] = "MACD_MOMENTUM"
+        recommendations["secondary_strategy"] = "EMA_CROSSOVER"
+        recommendations["avoid_strategies"] = ["VWAP", "BOLLINGER"]
+        recommendations["confidence"] = min(85, 60 + adx)
+        recommendations["reasoning"] = f"Strong trend (ADX={adx:.0f}), use momentum"
+    
+    # Low ADX (< 20) + ranging/choppy = mean reversion
+    elif adx < 20 and regime in ("ranging", "choppy"):
+        recommendations["primary_strategy"] = "VWAP_EXTREME"
+        recommendations["secondary_strategy"] = "BOLLINGER"
+        recommendations["avoid_strategies"] = ["MACD_MOMENTUM", "EMA_CROSSOVER"]
+        recommendations["confidence"] = min(75, 50 + (20 - adx) * 2)
+        recommendations["reasoning"] = f"Weak trend (ADX={adx:.0f}), use mean reversion"
+    
+    # High volatility (ATR > 2.5%) = ORB/momentum in morning only
+    elif atr_pct > 0.025:
+        recommendations["primary_strategy"] = "ORB_BREAKOUT"
+        recommendations["secondary_strategy"] = "MOMENTUM"
+        recommendations["avoid_strategies"] = ["AFTERNOON_TREND"]
+        recommendations["confidence"] = 65
+        recommendations["reasoning"] = f"High volatility (ATR={atr_pct*100:.1f}%), morning momentum"
+    
+    # RSI extreme + mean reversion setup
+    elif rsi < 30 or rsi > 70:
+        recommendations["primary_strategy"] = "VWAP_EXTREME"
+        recommendations["secondary_strategy"] = "BOLLINGER"
+        recommendations["avoid_strategies"] = []
+        recommendations["confidence"] = min(80, 50 + abs(rsi - 50))
+        recommendations["reasoning"] = f"RSI extreme ({rsi:.0f}), mean reversion setup"
+    
+    # Default: balanced approach
+    else:
+        recommendations["primary_strategy"] = "MOMENTUM"
+        recommendations["secondary_strategy"] = "EMA_CROSSOVER"
+        recommendations["avoid_strategies"] = []
+        recommendations["confidence"] = 50 + int(ml_confidence * 100)
+        recommendations["reasoning"] = "Balanced setup, multiple strategies"
+    
+    # Adjust confidence based on ML model confidence
+    recommendations["confidence"] = min(95, recommendations["confidence"] + int(ml_confidence * 30))
+    
+    return recommendations
 
 # Initialize dynamic filters (updated daily)
 STOCK_BLACKLIST, STOCK_WHITELIST, STOCK_SCORES = get_dynamic_filters()
@@ -353,13 +424,18 @@ def fetch_vix(target_date=None):
 
 def detect_market_trend(vix, target_date=None):
     """
-    Detect overall market trend at market open to dynamically enable LONG/SHORT.
+    Detect overall market trend using INTRADAY data (not stale daily data).
+    
+    KEY CHANGE FOR INTRADAY:
+    - Uses today's open as reference (not yesterday's close)
+    - Position in today's range determines bias
+    - Recent momentum (last 30 min) matters more than weekly trend
     
     Analysis factors:
-    1. Nifty 50 trend (5-day momentum)
-    2. VIX level (fear indicator)
-    3. Gap up/down from previous close
-    4. Global market cues (SGX Nifty proxy)
+    1. Intraday change from today's open
+    2. Position in today's range (0=low, 1=high)
+    3. VIX level (fear indicator)
+    4. Recent 30-min momentum
     
     Returns: dict with trend info and trading directions
     """
@@ -370,144 +446,135 @@ def detect_market_trend(vix, target_date=None):
         "confidence": 50,
         "enable_longs": True,
         "enable_shorts": True,
-        "max_longs": 5,
-        "max_shorts": 5,
+        "max_longs": 3,
+        "max_shorts": 3,
         "reason": "",
     }
     
     try:
-        import yfinance as yf
-        
-        # Fetch Nifty 50 data
+        # For backtest, fetch historical intraday data
         if target_date and target_date != date.today():
-            start = target_date - timedelta(days=10)
+            import yfinance as yf
+            start = target_date
             end = target_date + timedelta(days=1)
-            nifty = yf.Ticker("^NSEI").history(start=start.isoformat(), end=end.isoformat())
+            nifty = yf.Ticker("^NSEI").history(start=start.isoformat(), end=end.isoformat(), interval="5m")
+            
+            if nifty.empty or len(nifty) < 6:
+                logger.warning("  Could not fetch Nifty intraday data for trend detection")
+                return result
+            
+            nifty = nifty.reset_index()
+            nifty.columns = [c.lower() for c in nifty.columns]
+            
+            # Calculate intraday metrics
+            today_open = float(nifty['open'].iloc[0])
+            today_high = float(nifty['high'].max())
+            today_low = float(nifty['low'].min())
+            current_price = float(nifty['close'].iloc[-1])
+            
+            intraday_change_pct = (current_price - today_open) / today_open * 100 if today_open > 0 else 0
+            range_size = today_high - today_low
+            position_in_range = (current_price - today_low) / range_size if range_size > 0 else 0.5
         else:
-            nifty = yf.Ticker("^NSEI").history(period="10d")
+            # For live trading, use cached Nifty data
+            NIFTY_CACHE.refresh(force=True)
+            
+            if NIFTY_CACHE.candles is None or len(NIFTY_CACHE.candles) < 6:
+                logger.warning("  Could not fetch Nifty intraday data for trend detection")
+                return result
+            
+            today_open = NIFTY_CACHE.today_open
+            current_price = NIFTY_CACHE.current_price
+            intraday_change_pct = NIFTY_CACHE.intraday_change_pct
+            position_in_range = NIFTY_CACHE.position_in_range
         
-        if nifty.empty or len(nifty) < 3:
-            logger.warning("  Could not fetch Nifty data for trend detection")
-            return result
-        
-        # Calculate trend indicators
-        nifty = nifty.reset_index()
-        latest_close = float(nifty.iloc[-1]["Close"])
-        prev_close = float(nifty.iloc[-2]["Close"])
-        week_ago_close = float(nifty.iloc[0]["Close"])
-        
-        # Daily change
-        daily_change_pct = (latest_close - prev_close) / prev_close * 100
-        
-        # Weekly momentum
-        weekly_change_pct = (latest_close - week_ago_close) / week_ago_close * 100
-        
-        # Simple moving averages
-        sma_5 = nifty["Close"].tail(5).mean()
-        sma_10 = nifty["Close"].mean()
-        
-        # Trend scoring (-100 to +100)
+        # Trend scoring based on INTRADAY metrics
         trend_score = 0
         reasons = []
         
-        # Factor 1: Weekly momentum (-30 to +30)
-        if weekly_change_pct > 2:
-            trend_score += 30
-            reasons.append(f"Strong weekly up +{weekly_change_pct:.1f}%")
-        elif weekly_change_pct > 0.5:
-            trend_score += 15
-            reasons.append(f"Weekly up +{weekly_change_pct:.1f}%")
-        elif weekly_change_pct < -2:
-            trend_score -= 30
-            reasons.append(f"Strong weekly down {weekly_change_pct:.1f}%")
-        elif weekly_change_pct < -0.5:
-            trend_score -= 15
-            reasons.append(f"Weekly down {weekly_change_pct:.1f}%")
-        
-        # Factor 2: Daily gap (-20 to +20)
-        if daily_change_pct > 1:
+        # Factor 1: Intraday change from TODAY'S OPEN (most important!)
+        if intraday_change_pct > 1.0:
+            trend_score += 40
+            reasons.append(f"Strong intraday up +{intraday_change_pct:.1f}%")
+        elif intraday_change_pct > 0.3:
             trend_score += 20
-            reasons.append(f"Gap up +{daily_change_pct:.1f}%")
-        elif daily_change_pct > 0.3:
-            trend_score += 10
-            reasons.append(f"Slight up +{daily_change_pct:.1f}%")
-        elif daily_change_pct < -1:
+            reasons.append(f"Intraday up +{intraday_change_pct:.1f}%")
+        elif intraday_change_pct < -1.0:
+            trend_score -= 40
+            reasons.append(f"Strong intraday down {intraday_change_pct:.1f}%")
+        elif intraday_change_pct < -0.3:
             trend_score -= 20
-            reasons.append(f"Gap down {daily_change_pct:.1f}%")
-        elif daily_change_pct < -0.3:
-            trend_score -= 10
-            reasons.append(f"Slight down {daily_change_pct:.1f}%")
+            reasons.append(f"Intraday down {intraday_change_pct:.1f}%")
+        else:
+            reasons.append(f"Flat intraday {intraday_change_pct:+.1f}%")
         
-        # Factor 3: Price vs SMAs (-20 to +20)
-        if latest_close > sma_5 > sma_10:
-            trend_score += 20
-            reasons.append("Above both SMAs (bullish)")
-        elif latest_close > sma_5:
+        # Factor 2: Position in TODAY'S range (0=at low, 1=at high)
+        if position_in_range > 0.75:
+            trend_score += 25
+            reasons.append(f"Near day high ({position_in_range:.0%})")
+        elif position_in_range > 0.55:
             trend_score += 10
-            reasons.append("Above 5-day SMA")
-        elif latest_close < sma_5 < sma_10:
-            trend_score -= 20
-            reasons.append("Below both SMAs (bearish)")
-        elif latest_close < sma_5:
+            reasons.append(f"Upper half ({position_in_range:.0%})")
+        elif position_in_range < 0.25:
+            trend_score -= 25
+            reasons.append(f"Near day low ({position_in_range:.0%})")
+        elif position_in_range < 0.45:
             trend_score -= 10
-            reasons.append("Below 5-day SMA")
+            reasons.append(f"Lower half ({position_in_range:.0%})")
         
-        # Factor 4: VIX level (-30 to +10)
+        # Factor 3: VIX level (still relevant for position sizing)
         if vix > 25:
-            trend_score -= 30
-            reasons.append(f"High VIX {vix:.1f} (fear)")
-        elif vix > 20:
             trend_score -= 15
+            reasons.append(f"High VIX {vix:.1f}")
+        elif vix > 20:
+            trend_score -= 5
             reasons.append(f"Elevated VIX {vix:.1f}")
         elif vix < 13:
-            trend_score += 10
-            reasons.append(f"Low VIX {vix:.1f} (complacent)")
+            trend_score += 5
+            reasons.append(f"Low VIX {vix:.1f}")
         
-        # Determine trend based on score
-        # LOSS MINIMIZATION: LONGs only in STRONG BULLISH (38% WR otherwise)
-        if trend_score >= 40:  # Very strong bull - rare
+        # Determine trend based on INTRADAY score
+        if trend_score >= 50:
             result["trend"] = "STRONG_BULLISH"
-            result["confidence"] = min(95, 70 + abs(trend_score))
-            result["enable_longs"] = True   # Only enable LONGs in VERY strong bull
+            result["confidence"] = min(95, 70 + abs(trend_score) // 2)
+            result["enable_longs"] = True
             result["enable_shorts"] = True
-            result["max_longs"] = 3         # Still limit LONGs
-            result["max_shorts"] = 5
+            result["max_longs"] = 5
+            result["max_shorts"] = 2
         elif trend_score >= 20:
             result["trend"] = "BULLISH"
-            result["confidence"] = min(85, 60 + abs(trend_score))
-            result["enable_longs"] = True   # Allow limited LONGs
+            result["confidence"] = min(85, 60 + abs(trend_score) // 2)
+            result["enable_longs"] = True
             result["enable_shorts"] = True
-            result["max_longs"] = 2
-            result["max_shorts"] = 6
-        elif trend_score <= -30:
+            result["max_longs"] = 4
+            result["max_shorts"] = 3
+        elif trend_score <= -50:
             result["trend"] = "BEARISH"
-            result["confidence"] = min(90, 60 + abs(trend_score))
-            result["enable_longs"] = False  # NO LONGs in bear market
+            result["confidence"] = min(95, 70 + abs(trend_score) // 2)
+            result["enable_longs"] = False
             result["enable_shorts"] = True
             result["max_longs"] = 0
-            result["max_shorts"] = 10
-        elif trend_score <= -10:
+            result["max_shorts"] = 6
+        elif trend_score <= -20:
             result["trend"] = "MILD_BEARISH"
-            result["confidence"] = 55 + abs(trend_score) // 2
-            result["enable_longs"] = False  # NO LONGs in mild bear
+            result["confidence"] = min(80, 55 + abs(trend_score) // 2)
+            result["enable_longs"] = True  # Allow 1 LONG in mild bear
             result["enable_shorts"] = True
-            result["max_longs"] = 0
-            result["max_shorts"] = 8
+            result["max_longs"] = 1
+            result["max_shorts"] = 5
         else:
-            # ══════════════════════════════════════════════════════════
-            # NEUTRAL market: Trade both directions but be selective
-            # KEY INSIGHT: Today was +1.2% bullish but detected as neutral
-            # Solution: Allow both but with smaller positions
-            # ══════════════════════════════════════════════════════════
             result["trend"] = "NEUTRAL"
             result["confidence"] = 50
-            result["enable_longs"] = True   # Allow LONGs in neutral
-            result["enable_shorts"] = True  # Allow SHORTs in neutral
-            result["max_longs"] = 3         # Limited
-            result["max_shorts"] = 3        # Limited
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 3
+            result["max_shorts"] = 3
         
         result["reason"] = " | ".join(reasons)
-        result["nifty_close"] = latest_close
+        result["nifty_open"] = today_open
+        result["nifty_current"] = current_price
+        result["intraday_change_pct"] = intraday_change_pct
+        result["position_in_range"] = position_in_range
         result["trend_score"] = trend_score
         
         # Update globals
@@ -533,15 +600,25 @@ def detect_market_trend(vix, target_date=None):
 #
 # The trick: Don't predict, REACT to where price IS in the day's range
 
-def get_realtime_market_bias(nifty_candles, current_idx):
+def get_realtime_market_bias(nifty_candles=None, current_idx=None):
     """
-    Get market bias based on WHERE price is in day's range.
+    Get market bias based on WHERE price is in TODAY's range.
     This adapts in real-time and catches V-reversals.
+    
+    NOW USES CACHED DATA for efficiency!
     
     Returns: (bias, confidence)
         bias: 1 (LONG), -1 (SHORT), 0 (NEUTRAL)
         confidence: 0-100
     """
+    # Use cached data if no candles provided
+    if nifty_candles is None:
+        return NIFTY_CACHE.get_intraday_bias()
+    
+    # Legacy support: if candles provided, use them
+    if current_idx is None:
+        current_idx = len(nifty_candles) - 1
+    
     if current_idx < 6:
         return 0, 0
     
@@ -550,30 +627,46 @@ def get_realtime_market_bias(nifty_candles, current_idx):
     day_low = nifty_candles['low'].iloc[:current_idx+1].min()
     day_high = nifty_candles['high'].iloc[:current_idx+1].max()
     
-    # Position in day's range (0 = at low, 1 = at high)
+    # Position in TODAY's range (0 = at low, 1 = at high)
     if day_high != day_low:
         position_in_range = (current - day_low) / (day_high - day_low)
     else:
         position_in_range = 0.5
     
-    # Recovery from low (key for V-reversals)
-    recovery = (current - day_low) / day_low * 100 if day_low > 0 else 0
+    # Intraday change from TODAY'S OPEN (not yesterday's close!)
+    intraday_change_pct = (current - open_price) / open_price * 100 if open_price > 0 else 0
     
     # Determine bias
     bias = 0
     confidence = 50
     
-    # LONG bias: Price in upper 60% of range AND recovering
-    if position_in_range > 0.6 and recovery > 0.3:
+    # LONG bias: Price in upper 55% of range
+    if position_in_range > 0.55:
         bias = 1
         confidence = min(85, 50 + position_in_range * 35)
-    # SHORT bias: Price in lower 40% AND making new lows
-    elif position_in_range < 0.4:
-        # Check if still falling
-        recent_low = nifty_candles['low'].iloc[max(0, current_idx-3):current_idx+1].min()
-        if recent_low <= day_low * 1.001:  # Near day's low
+        # Boost if intraday is also positive
+        if intraday_change_pct > 0.3:
+            confidence = min(90, confidence + 5)
+    
+    # SHORT bias: Price in lower 45% of range
+    elif position_in_range < 0.45:
+        bias = -1
+        confidence = min(85, 50 + (1 - position_in_range) * 35)
+        # Boost if intraday is also negative
+        if intraday_change_pct < -0.3:
+            confidence = min(90, confidence + 5)
+    
+    # Check for recent momentum (last 3 candles)
+    if current_idx >= 3:
+        recent_change = (nifty_candles['close'].iloc[current_idx] - 
+                        nifty_candles['close'].iloc[current_idx-3]) / nifty_candles['close'].iloc[current_idx-3] * 100
+        # Strong recent momentum can flip or strengthen bias
+        if recent_change > 0.2 and bias != -1:
+            bias = 1
+            confidence = min(85, confidence + 5)
+        elif recent_change < -0.2 and bias != 1:
             bias = -1
-            confidence = min(85, 50 + (1 - position_in_range) * 35)
+            confidence = min(85, confidence + 5)
     
     return bias, confidence
 
@@ -583,6 +676,225 @@ SECTOR_PERFORMANCE = {}
 TOP_SECTORS = []
 WEAK_SECTORS = []
 VIX_LEVEL = 15.0  # Default, updated at open
+
+
+# ════════════════════════════════════════════════════════════
+# NIFTY INTRADAY CACHE — Avoid repeated API calls
+# ════════════════════════════════════════════════════════════
+
+class NiftyIntradayCache:
+    """
+    Cache Nifty 50 intraday data with automatic refresh.
+    
+    Key insight: For intraday trading, we only care about TODAY's data.
+    - Refreshes every 5 minutes (aligned with candle intervals)
+    - Provides instant access for trend/bias calculations
+    - Reduces API calls from ~750/day to ~75/day
+    """
+    
+    def __init__(self, refresh_interval_sec=300):
+        self.refresh_interval = refresh_interval_sec  # 5 min default
+        self.last_fetch = None
+        self.candles = None
+        self.today_open = None
+        self.today_high = None
+        self.today_low = None
+        self.current_price = None
+        self.intraday_change_pct = 0.0
+        self.position_in_range = 0.5  # 0=at low, 1=at high
+        self._lock = False
+    
+    def _needs_refresh(self):
+        if self.candles is None or self.last_fetch is None:
+            return True
+        elapsed = (datetime.now() - self.last_fetch).total_seconds()
+        return elapsed >= self.refresh_interval
+    
+    def refresh(self, force=False):
+        """Fetch fresh Nifty intraday data."""
+        if not force and not self._needs_refresh():
+            return self.candles
+        
+        if self._lock:
+            return self.candles
+        
+        self._lock = True
+        try:
+            import yfinance as yf
+            nifty = yf.Ticker("^NSEI").history(period="1d", interval="5m")
+            
+            if nifty.empty or len(nifty) < 2:
+                self._lock = False
+                return self.candles
+            
+            nifty = nifty.reset_index()
+            nifty.columns = [c.lower() for c in nifty.columns]
+            
+            self.candles = nifty
+            self.last_fetch = datetime.now()
+            
+            # Calculate intraday metrics
+            self.today_open = float(nifty['open'].iloc[0])
+            self.today_high = float(nifty['high'].max())
+            self.today_low = float(nifty['low'].min())
+            self.current_price = float(nifty['close'].iloc[-1])
+            
+            # Intraday change from TODAY'S OPEN (not yesterday's close)
+            if self.today_open > 0:
+                self.intraday_change_pct = (self.current_price - self.today_open) / self.today_open * 100
+            
+            # Position in today's range (0=at low, 1=at high)
+            range_size = self.today_high - self.today_low
+            if range_size > 0:
+                self.position_in_range = (self.current_price - self.today_low) / range_size
+            else:
+                self.position_in_range = 0.5
+            
+            logger.debug(f"NiftyCache refreshed: {len(nifty)} candles, "
+                        f"open={self.today_open:.0f}, current={self.current_price:.0f}, "
+                        f"change={self.intraday_change_pct:+.2f}%, pos={self.position_in_range:.2f}")
+        
+        except Exception as e:
+            logger.warning(f"NiftyCache refresh failed: {e}")
+        finally:
+            self._lock = False
+        
+        return self.candles
+    
+    def get_candles(self):
+        """Get cached candles, refreshing if needed."""
+        self.refresh()
+        return self.candles
+    
+    def get_intraday_bias(self):
+        """
+        Get market bias based on WHERE price is in TODAY's range.
+        This is the KEY intraday insight — not historical trend!
+        
+        Returns: (bias, confidence)
+            bias: 1 (LONG), -1 (SHORT), 0 (NEUTRAL)
+            confidence: 0-100
+        """
+        self.refresh()
+        
+        if self.candles is None or len(self.candles) < 6:
+            return 0, 0
+        
+        bias = 0
+        confidence = 50
+        
+        # Position in range determines bias
+        # Upper 60% = LONG bias, Lower 40% = SHORT bias
+        if self.position_in_range > 0.6:
+            bias = 1
+            confidence = min(85, 50 + self.position_in_range * 35)
+        elif self.position_in_range < 0.4:
+            bias = -1
+            confidence = min(85, 50 + (1 - self.position_in_range) * 35)
+        
+        # Boost confidence if intraday change aligns with position
+        if bias == 1 and self.intraday_change_pct > 0.3:
+            confidence = min(90, confidence + 10)
+        elif bias == -1 and self.intraday_change_pct < -0.3:
+            confidence = min(90, confidence + 10)
+        
+        return bias, confidence
+    
+    def get_intraday_trend(self):
+        """
+        Detect trend using ONLY intraday data — not stale daily data.
+        
+        Returns: dict with trend info
+        """
+        self.refresh()
+        
+        result = {
+            "trend": "NEUTRAL",
+            "confidence": 50,
+            "enable_longs": True,
+            "enable_shorts": True,
+            "max_longs": 3,
+            "max_shorts": 3,
+            "reason": "",
+            "intraday_change_pct": self.intraday_change_pct,
+            "position_in_range": self.position_in_range,
+        }
+        
+        if self.candles is None or len(self.candles) < 6:
+            return result
+        
+        reasons = []
+        
+        # Factor 1: Intraday change from open (most important!)
+        if self.intraday_change_pct > 1.0:
+            result["trend"] = "STRONG_BULLISH"
+            result["confidence"] = min(90, 70 + abs(self.intraday_change_pct) * 10)
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 5
+            result["max_shorts"] = 2
+            reasons.append(f"Strong intraday up +{self.intraday_change_pct:.1f}%")
+        elif self.intraday_change_pct > 0.3:
+            result["trend"] = "BULLISH"
+            result["confidence"] = min(80, 60 + abs(self.intraday_change_pct) * 15)
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 4
+            result["max_shorts"] = 3
+            reasons.append(f"Intraday up +{self.intraday_change_pct:.1f}%")
+        elif self.intraday_change_pct < -1.0:
+            result["trend"] = "BEARISH"
+            result["confidence"] = min(90, 70 + abs(self.intraday_change_pct) * 10)
+            result["enable_longs"] = False
+            result["enable_shorts"] = True
+            result["max_longs"] = 0
+            result["max_shorts"] = 6
+            reasons.append(f"Strong intraday down {self.intraday_change_pct:.1f}%")
+        elif self.intraday_change_pct < -0.3:
+            result["trend"] = "MILD_BEARISH"
+            result["confidence"] = min(75, 55 + abs(self.intraday_change_pct) * 15)
+            result["enable_longs"] = False
+            result["enable_shorts"] = True
+            result["max_longs"] = 1
+            result["max_shorts"] = 5
+            reasons.append(f"Intraday down {self.intraday_change_pct:.1f}%")
+        else:
+            result["trend"] = "NEUTRAL"
+            result["confidence"] = 50
+            result["enable_longs"] = True
+            result["enable_shorts"] = True
+            result["max_longs"] = 3
+            result["max_shorts"] = 3
+            reasons.append(f"Flat intraday {self.intraday_change_pct:+.1f}%")
+        
+        # Factor 2: Position in today's range
+        if self.position_in_range > 0.75:
+            reasons.append("Near day high (bullish)")
+            if result["trend"] in ("BULLISH", "STRONG_BULLISH"):
+                result["confidence"] = min(95, result["confidence"] + 5)
+        elif self.position_in_range < 0.25:
+            reasons.append("Near day low (bearish)")
+            if result["trend"] in ("BEARISH", "MILD_BEARISH"):
+                result["confidence"] = min(95, result["confidence"] + 5)
+        
+        # Factor 3: Recent momentum (last 6 candles = 30 min)
+        if len(self.candles) >= 6:
+            recent = self.candles.tail(6)
+            recent_change = (recent['close'].iloc[-1] - recent['close'].iloc[0]) / recent['close'].iloc[0] * 100
+            if recent_change > 0.2:
+                reasons.append(f"30min momentum +{recent_change:.1f}%")
+            elif recent_change < -0.2:
+                reasons.append(f"30min momentum {recent_change:.1f}%")
+        
+        result["reason"] = " | ".join(reasons)
+        result["nifty_open"] = self.today_open
+        result["nifty_current"] = self.current_price
+        
+        return result
+
+
+# Global Nifty cache instance
+NIFTY_CACHE = NiftyIntradayCache(refresh_interval_sec=300)  # 5 min refresh
 
 def detect_sector_rotation():
     """
@@ -855,11 +1167,44 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
         composite = ml_score + delivery_bonus + trade_count_bonus + vol_fitness + perf_bonus
         sector = STOCK_SECTORS.get(sym, "Other")
 
+        # ══════════════════════════════════════════════════════════════
+        # ML-ENHANCED FEATURES for intraday trading
+        # ══════════════════════════════════════════════════════════════
+        
+        # ML volatility prediction (ATR expected vs actual)
+        expected_atr = last.get("atr_14", atr_pct * last.get("close", 100))
+        volatility_ratio = atr_pct / 0.02 if atr_pct > 0 else 1.0  # vs 2% baseline
+        
+        # ML momentum features
+        momentum_5 = last.get("momentum_5", 0)  # 5-day momentum
+        momentum_10 = last.get("momentum_10", 0)  # 10-day momentum
+        
+        # ML trend strength (from features if available)
+        adx = last.get("adx", 25)  # Average Directional Index
+        trend_strength = "strong" if adx > 25 else "weak"
+        
+        # Optimal entry time suggestion based on historical patterns
+        # (ML could be trained to predict best entry windows)
+        if atr_pct > 0.025:
+            optimal_window = "morning"  # High vol stocks better in morning
+        elif atr_pct < 0.015:
+            optimal_window = "afternoon"  # Low vol stocks need time to move
+        else:
+            optimal_window = "any"
+        
         candidates.append({
             "symbol": sym, "ml_score": ml_score, "direction": direction,
+            "ml_prob": ml_prob, "ml_confidence": ml_confidence,
             "rsi": rsi, "atr_pct": round(atr_pct, 4), "avg_volume": int(avg_vol),
             "delivery_pct": nse.get("delivery_pct", 0),
             "composite_score": round(composite, 1), "sector": sector,
+            # NEW ML-enhanced fields
+            "volatility_ratio": round(volatility_ratio, 2),
+            "momentum_5": round(momentum_5, 4) if momentum_5 else 0,
+            "momentum_10": round(momentum_10, 4) if momentum_10 else 0,
+            "adx": round(adx, 1) if adx else 25,
+            "trend_strength": trend_strength,
+            "optimal_window": optimal_window,
         })
 
     if not candidates:
@@ -966,7 +1311,7 @@ class AdaptiveV3Trader:
     - Regime-based strategy switching
     """
 
-    def __init__(self, symbol, direction, config, ml_score=50):
+    def __init__(self, symbol, direction, config, ml_score=50, claude_brain=None, ml_features=None):
         self.symbol = symbol
         self.direction = direction  # Now overridden by real-time bias in _scan_for_entry
         self.ml_score = ml_score  # Used for stock SELECTION only, not direction
@@ -975,7 +1320,19 @@ class AdaptiveV3Trader:
         self.cost_model = AngelOneCostModel()
         self.strategy = ProStrategyV2(config.get("strategies", {}).get("pro", {}))
         self.regime_detector = RegimeDetector()
-        self.pattern_detector = CandlePatternDetector()  # NEW: Candlestick patterns
+        self.pattern_detector = CandlePatternDetector()  # Candlestick patterns
+        self.claude_brain = claude_brain  # Optional: Claude Brain for entry confirmation
+        
+        # ══════════════════════════════════════════════════════════════
+        # ML-ENHANCED FEATURES for smarter trading decisions
+        # ══════════════════════════════════════════════════════════════
+        self.ml_features = ml_features or {}
+        self.ml_prob = self.ml_features.get("ml_prob", 0.5)
+        self.ml_confidence = self.ml_features.get("ml_confidence", 0.0)
+        self.volatility_ratio = self.ml_features.get("volatility_ratio", 1.0)
+        self.trend_strength = self.ml_features.get("trend_strength", "weak")
+        self.optimal_window = self.ml_features.get("optimal_window", "any")
+        self.adx = self.ml_features.get("adx", 25)
 
         # State
         self.orb = None
@@ -992,7 +1349,17 @@ class AdaptiveV3Trader:
         self.trade_type = ""
         self.current_regime = "unknown"
         self.entry_regime = "unknown"  # regime at time of entry
-        self.pattern_score = 0  # NEW: Track pattern confirmation
+        self.pattern_score = 0  # Track pattern confirmation
+        
+        # ══════════════════════════════════════════════════════════════
+        # INTRADAY-SPECIFIC STATE
+        # ══════════════════════════════════════════════════════════════
+        self.today_open = None       # Today's opening price
+        self.today_high = None       # Today's high so far
+        self.today_low = None        # Today's low so far
+        self.gap_pct = 0.0           # Gap from previous close
+        self.position_in_range = 0.5 # Where price is in today's range (0-1)
+        self.intraday_change_pct = 0.0  # Change from today's open
 
         self.trades = []
         self.trade_count = 0
@@ -1097,6 +1464,56 @@ class AdaptiveV3Trader:
             logger.debug(f"Pattern check error: {e}")
             self.pattern_score = 0
         
+        # ── CLAUDE BRAIN CONFIRMATION (optional, for high-value trades) ──
+        # Only consult Claude for larger position sizes to save API calls
+        if self.claude_brain and self.claude_brain.enabled:
+            try:
+                # Build intraday data for Claude
+                intraday_data = {
+                    "today_open": self.today_open,
+                    "current_price": signal["entry"],
+                    "today_high": self.today_high,
+                    "today_low": self.today_low,
+                    "intraday_change_pct": self.intraday_change_pct,
+                    "position_in_range": self.position_in_range,
+                    "volume_vs_avg": 1.0,  # Would need to calculate
+                    "vwap": signal.get("vwap", signal["entry"]),
+                }
+                
+                # Get Nifty bias from cache
+                nifty_bias = "LONG" if NIFTY_CACHE.position_in_range > 0.55 else "SHORT" if NIFTY_CACHE.position_in_range < 0.45 else "NEUTRAL"
+                
+                # Ask Claude for confirmation
+                claude_advice = self.claude_brain.analyze_stock_intraday(
+                    self.symbol, 
+                    intraday_data, 
+                    nifty_bias, 
+                    self.current_regime
+                )
+                
+                if claude_advice:
+                    # Check if Claude says to skip
+                    if not claude_advice.get("take_trade", True):
+                        logger.info(f"  {self.symbol} SKIP: Claude says no - {claude_advice.get('reason', 'N/A')}")
+                        return
+                    
+                    # Adjust position size based on Claude's confidence
+                    confidence = claude_advice.get("confidence", 50)
+                    if confidence < 40:
+                        logger.info(f"  {self.symbol} SKIP: Claude confidence too low ({confidence}%)")
+                        return
+                    
+                    # Use Claude's suggested levels if provided and valid
+                    if claude_advice.get("stop_loss") and claude_advice["stop_loss"] > 0:
+                        signal["sl"] = claude_advice["stop_loss"]
+                    if claude_advice.get("target") and claude_advice["target"] > 0:
+                        signal["tgt"] = claude_advice["target"]
+                    
+                    signal["reason"] = f"{signal.get('reason', '')} | Claude: {confidence}%"
+                    
+            except Exception as e:
+                logger.debug(f"Claude entry check error: {e}")
+        
         self.entry_price = signal["entry"]
         self.entry_time = signal["time"]
         self.entry_idx = idx
@@ -1134,6 +1551,31 @@ class AdaptiveV3Trader:
         # Afternoon trades get 60% position (riskier time)
         if "AFTERNOON" in self.trade_type:
             risk_pct *= 0.6
+        
+        # ══════════════════════════════════════════════════════════════
+        # ML-BASED POSITION SIZING ADJUSTMENT
+        # Use ML features to adjust position size
+        # ══════════════════════════════════════════════════════════════
+        
+        # High ML confidence = larger position
+        if self.ml_confidence >= 0.20:  # 20%+ confidence
+            risk_pct *= 1.2  # 20% larger position
+            signal["reason"] = f"{signal.get('reason', '')} | ML conf +20%"
+        elif self.ml_confidence >= 0.15:
+            risk_pct *= 1.1  # 10% larger
+        elif self.ml_confidence < 0.10:
+            risk_pct *= 0.8  # 20% smaller for low confidence
+        
+        # Strong trend (ADX > 30) = larger position in trend direction
+        if self.adx > 30 and self.trend_strength == "strong":
+            risk_pct *= 1.15
+            signal["reason"] = f"{signal.get('reason', '')} | ADX {self.adx:.0f}"
+        
+        # High volatility ratio = smaller position (risk management)
+        if self.volatility_ratio > 1.5:  # 50% more volatile than baseline
+            risk_pct *= 0.7
+        elif self.volatility_ratio < 0.7:  # 30% less volatile
+            risk_pct *= 1.1  # Can take slightly larger position
 
         # ── FIX 1b: Cap max shares to limit single-trade damage ──
         # INTRADAY MARGIN: Get actual margin from Angel One API (or fallback to 20%)
@@ -1215,6 +1657,28 @@ class AdaptiveV3Trader:
         h, l, c = row["high"], row["low"], row["close"]
         hour, minute = t.hour, t.minute
 
+        # ══════════════════════════════════════════════════════════════
+        # INTRADAY TRACKING: Update today's metrics on every candle
+        # ══════════════════════════════════════════════════════════════
+        if i == 0:
+            # First candle = today's open
+            self.today_open = row["open"]
+            self.today_high = h
+            self.today_low = l
+        else:
+            # Update today's high/low
+            self.today_high = max(self.today_high or h, h)
+            self.today_low = min(self.today_low or l, l)
+        
+        # Calculate intraday metrics
+        if self.today_open and self.today_open > 0:
+            self.intraday_change_pct = (c - self.today_open) / self.today_open * 100
+        
+        if self.today_high and self.today_low and self.today_high > self.today_low:
+            self.position_in_range = (c - self.today_low) / (self.today_high - self.today_low)
+        else:
+            self.position_in_range = 0.5
+
         # Update regime every 6 candles (30 min)
         if i % 6 == 0 and i >= 12:
             self.current_regime = self.regime_detector.detect(candles, i)
@@ -1223,14 +1687,23 @@ class AdaptiveV3Trader:
         if self.day_pnl < -self.daily_loss_limit and not self.in_trade:
             return
 
-        # ── Phase 1: ORB Formation ──
+        # ══════════════════════════════════════════════════════════════
+        # Phase 1: ORB Formation (with INTRADAY gap awareness)
+        # ══════════════════════════════════════════════════════════════
         if self.orb is None:
             if i < self.strategy.orb_candles:
                 return
             self.orb = self.strategy.compute_orb(candles, self.strategy.orb_candles)
             if self.orb is None or self.orb["range"] < 0.5:
                 return
-            msg = f"📐 {self.symbol} ORB: H={self.orb['high']:,.2f} L={self.orb['low']:,.2f} R={self.orb['range']:,.2f} | Regime: {self.current_regime}"
+            
+            # Add today's open to ORB for gap-adjusted analysis
+            self.orb["today_open"] = self.today_open
+            self.orb["gap_direction"] = "UP" if c > self.today_open else "DOWN" if c < self.today_open else "FLAT"
+            
+            msg = (f"📐 {self.symbol} ORB: H={self.orb['high']:,.2f} L={self.orb['low']:,.2f} "
+                   f"R={self.orb['range']:,.2f} | Open={self.today_open:,.2f} | "
+                   f"Gap={self.orb['gap_direction']} | Regime: {self.current_regime}")
             logger.info(f"  {msg}")
 
         # ── Phase 2: Square off ──
@@ -1389,18 +1862,14 @@ class AdaptiveV3Trader:
 
     def _scan_for_entry(self, candles, i):
         """
-        Scan for entry signals using PURE PRICE ACTION (no ML for direction).
+        Scan for entry signals using PURE INTRADAY PRICE ACTION.
         
-        KEY INSIGHT FROM APRIL 2:
-        - ML predicted SHORT at 9:45 AM (market down -0.89%)
-        - Market reversed to +1.42% by close
-        - ML direction was WRONG all day
-        
-        CORRECT APPROACH (Pure Price Action):
-        - Direction = WHERE price IS in day's range (not ML prediction)
+        KEY INSIGHT FOR INTRADAY:
+        - Direction = WHERE price IS in TODAY's range (not ML/daily prediction)
         - Upper 55% of range → LONG bias
         - Lower 45% of range → SHORT bias
         - This adapts EVERY CANDLE to reversals!
+        - Uses CACHED Nifty data (no repeated API calls)
         """
         row = candles.iloc[i]
         t = pd.to_datetime(row["datetime"])
@@ -1416,38 +1885,38 @@ class AdaptiveV3Trader:
             return
         
         # ══════════════════════════════════════════════════════════════
-        # DON'T TRADE FIRST HOUR (let market establish range)
+        # ML-BASED TIME WINDOW FILTER
+        # Use ML's optimal_window suggestion for entry timing
         # ══════════════════════════════════════════════════════════════
         if hour < 5:  # Before ~10:15 AM IST (UTC+5:30)
-            return
+            # Exception: Allow morning entries for high-vol stocks
+            if self.optimal_window != "morning" or hour < 4:
+                return
+        
+        # Skip afternoon entries for stocks that work better in morning
+        if hour >= 8 and self.optimal_window == "morning":
+            return  # ~13:30+ IST, skip if stock is morning-optimal
         
         # ══════════════════════════════════════════════════════════════
-        # PURE PRICE ACTION: Get direction from CURRENT price position
-        # This is the KEY fix - NO ML direction, only real-time bias!
+        # INTRADAY PRICE ACTION: Get direction from CACHED Nifty data
+        # Uses NiftyCache — refreshes every 5 min, no repeated API calls!
         # ══════════════════════════════════════════════════════════════
         realtime_bias = 0
         direction = "NEUTRAL"
         
-        try:
-            import yfinance as yf
-            nifty = yf.Ticker("^NSEI").history(period="1d", interval="5m")
-            if len(nifty) > 0:
-                nifty = nifty.reset_index()
-                nifty.columns = [c.lower() for c in nifty.columns]
-                realtime_bias, bias_conf = get_realtime_market_bias(nifty, len(nifty)-1)
-                
-                if realtime_bias == 1:
-                    direction = "LONG"
-                elif realtime_bias == -1:
-                    direction = "SHORT"
-                else:
-                    return  # NEUTRAL = don't trade
-                    
-                # Need minimum confidence to trade
-                if bias_conf < 55:
-                    return
-        except:
-            return  # If can't get real-time data, don't trade (no guessing)
+        # Use cached Nifty data (auto-refreshes every 5 min)
+        realtime_bias, bias_conf = NIFTY_CACHE.get_intraday_bias()
+        
+        if realtime_bias == 1:
+            direction = "LONG"
+        elif realtime_bias == -1:
+            direction = "SHORT"
+        else:
+            return  # NEUTRAL = don't trade
+        
+        # Need minimum confidence to trade
+        if bias_conf < 55:
+            return
         
         # ══════════════════════════════════════════════════════════════
         # SECTOR ROTATION FILTER (April 2 insight: IT +1.89%, Pharma -0.56%)
@@ -1466,6 +1935,13 @@ class AdaptiveV3Trader:
             day_range_pct = (day_high - day_low) / day_low if day_low > 0 else 0
             if day_range_pct < 0.004:  # less than 0.4% range all day
                 return  # dead market, skip
+        
+        # ══════════════════════════════════════════════════════════════
+        # ML STRATEGY RECOMMENDATION
+        # Use ML features to determine best strategy for this stock
+        # ══════════════════════════════════════════════════════════════
+        ml_rec = get_ml_strategy_recommendation(self.ml_features, regime)
+        avoid_strategies = ml_rec.get("avoid_strategies", [])
 
         # ══════════════════════════════════════════════════════════════
         # STRATEGY 1: ORB BREAKOUT/BREAKDOWN (9:20-10:30)
@@ -1473,58 +1949,123 @@ class AdaptiveV3Trader:
         # - In BEARISH market + trending_down: ORB BREAKDOWN (SHORT)
         # ══════════════════════════════════════════════════════════════
         if hour < 10 or (hour == 10 and minute <= 30):
-            if regime == "trending_down" and direction == "SHORT":
-                signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
-            elif regime == "trending_up" and direction == "LONG":
-                signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
-
-        # ══════════════════════════════════════════════════════════════
-        # STRATEGY 2: MOMENTUM (11:30-14:00)
-        # Trade in direction of market trend
-        # ══════════════════════════════════════════════════════════════
-        if (hour == 11 and minute >= 30) or (12 <= hour <= 13):
-            # Allow momentum in both directions based on regime
-            if regime == "trending_down" and direction == "SHORT":
-                signal = self._generate_momentum_signal(candles, i, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
-            elif regime == "trending_up" and direction == "LONG":
-                signal = self._generate_momentum_signal(candles, i, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
-            elif regime == "choppy":
-                # In choppy, only trade with very strong signals
-                signal = self._generate_momentum_signal(candles, i, direction, lookback=8)
-                if signal and abs(signal.get("risk", 0)) > 0:
-                    avg_vol = candles["volume"].iloc[max(0, i - 20):i].mean()
-                    curr_vol = candles["volume"].iloc[i]
-                    if curr_vol > avg_vol * 1.5:
+            if "ORB" not in avoid_strategies:
+                if regime == "trending_down" and direction == "SHORT":
+                    signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
+                    if signal:
+                        signal["ml_rec"] = ml_rec.get("primary_strategy")
+                        self._enter_trade(signal, i)
+                        return
+                elif regime == "trending_up" and direction == "LONG":
+                    signal = self.strategy.generate_orb_signal(candles, i, self.orb, direction)
+                    if signal:
+                        signal["ml_rec"] = ml_rec.get("primary_strategy")
                         self._enter_trade(signal, i)
                         return
 
         # ══════════════════════════════════════════════════════════════
-        # STRATEGY 3: AFTERNOON TREND (13:00-14:30)
+        # STRATEGY 2: EMA 9/21 CROSSOVER (9:45-14:30)
+        # Works best in trending regimes — ML recommends for strong trends
+        # ══════════════════════════════════════════════════════════════
+        if (hour == 9 and minute >= 45) or (10 <= hour <= 14):
+            if "EMA_CROSSOVER" not in avoid_strategies:
+                if regime in ("trending_up", "trending_down"):
+                    signal = self.strategy.generate_ema_crossover_signal(candles, i, direction)
+                    if signal:
+                        # Add MACD confirmation
+                        macd_ok, macd_strength = self.strategy.check_macd_confirmation(candles, i, direction)
+                        if macd_ok and macd_strength >= 0.6:
+                            signal["reason"] = f"{signal['reason']} | MACD {macd_strength:.0%}"
+                            # Boost if ML recommends this strategy
+                            if ml_rec.get("primary_strategy") == "EMA_CROSSOVER":
+                                signal["reason"] = f"{signal['reason']} | ML recommended"
+                            self._enter_trade(signal, i)
+                            return
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 3: MACD MOMENTUM (9:45-14:30)
+        # Pure momentum play — ML recommends for high ADX
+        # ══════════════════════════════════════════════════════════════
+        if (hour == 9 and minute >= 45) or (10 <= hour <= 14):
+            if "MACD_MOMENTUM" not in avoid_strategies:
+                if regime in ("trending_up", "trending_down", "volatile"):
+                    signal = self.strategy.generate_macd_signal(candles, i, direction)
+                    if signal:
+                        if ml_rec.get("primary_strategy") == "MACD_MOMENTUM":
+                            signal["reason"] = f"{signal['reason']} | ML recommended"
+                        self._enter_trade(signal, i)
+                        return
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 4: MOMENTUM CONTINUATION (11:30-14:00)
+        # Trade in direction of market trend
+        # ══════════════════════════════════════════════════════════════
+        if (hour == 11 and minute >= 30) or (12 <= hour <= 13):
+            if "MOMENTUM" not in avoid_strategies:
+                if regime == "trending_down" and direction == "SHORT":
+                    signal = self._generate_momentum_signal(candles, i, direction)
+                    if signal:
+                        self._enter_trade(signal, i)
+                        return
+                elif regime == "trending_up" and direction == "LONG":
+                    signal = self._generate_momentum_signal(candles, i, direction)
+                    if signal:
+                        self._enter_trade(signal, i)
+                        return
+                elif regime == "choppy":
+                    # In choppy, only trade with very strong signals
+                    signal = self._generate_momentum_signal(candles, i, direction, lookback=8)
+                    if signal and abs(signal.get("risk", 0)) > 0:
+                        today_avg_vol = candles["volume"].iloc[:i].mean() if i > 0 else 0
+                        curr_vol = candles["volume"].iloc[i]
+                        if today_avg_vol > 0 and curr_vol > today_avg_vol * 1.5:
+                            self._enter_trade(signal, i)
+                            return
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 5: IMPROVED VWAP MEAN REVERSION (10:30-14:00)
+        # ML recommends for low ADX / ranging markets
+        # ══════════════════════════════════════════════════════════════
+        if (hour == 10 and minute >= 30) or (11 <= hour <= 14):
+            if "VWAP" not in avoid_strategies and "VWAP_EXTREME" not in avoid_strategies:
+                if regime in ("ranging", "choppy"):
+                    signal = self.strategy.generate_vwap_improved_signal(candles, i, direction)
+                    if signal:
+                        if ml_rec.get("primary_strategy") == "VWAP_EXTREME":
+                            signal["reason"] = f"{signal['reason']} | ML recommended"
+                        self._enter_trade(signal, i)
+                        return
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 6: BOLLINGER BANDS MEAN REVERSION (10:30-14:00)
+        # ML recommends for low ADX / ranging markets
+        # ══════════════════════════════════════════════════════════════
+        if (hour == 10 and minute >= 30) or (11 <= hour <= 14):
+            if "BOLLINGER" not in avoid_strategies:
+                if regime in ("ranging", "choppy"):
+                    signal = self.strategy.generate_bollinger_signal(candles, i, direction)
+                    if signal:
+                        if ml_rec.get("secondary_strategy") == "BOLLINGER":
+                            signal["reason"] = f"{signal['reason']} | ML recommended"
+                        self._enter_trade(signal, i)
+                        return
+
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 7: AFTERNOON TREND (13:00-14:30)
         # Trade in direction of established intraday trend
         # ══════════════════════════════════════════════════════════════
         if 13 <= hour <= 14 and minute <= 30:
-            if regime in ("trending_down", "choppy") and direction == "SHORT":
-                signal = self._generate_afternoon_trend_signal(candles, i, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
-            elif regime in ("trending_up", "choppy") and direction == "LONG":
-                signal = self._generate_afternoon_trend_signal(candles, i, direction)
-                if signal:
-                    self._enter_trade(signal, i)
-                    return
+            if "AFTERNOON_TREND" not in avoid_strategies:
+                if regime in ("trending_down", "choppy") and direction == "SHORT":
+                    signal = self._generate_afternoon_trend_signal(candles, i, direction)
+                    if signal:
+                        self._enter_trade(signal, i)
+                        return
+                elif regime in ("trending_up", "choppy") and direction == "LONG":
+                    signal = self._generate_afternoon_trend_signal(candles, i, direction)
+                    if signal:
+                        self._enter_trade(signal, i)
+                        return
 
     def _generate_momentum_signal(self, candles, i, direction, lookback=8):
         """Momentum continuation in real-time market direction."""
@@ -1537,10 +2078,13 @@ class AdaptiveV3Trader:
         recent = candles.iloc[max(0, i - lookback):i + 1]
         price_change = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
 
-        # Volume confirmation
-        avg_vol = candles["volume"].iloc[max(0, i - 20):i].mean()
+        # ══════════════════════════════════════════════════════════════
+        # INTRADAY FIX: Compare volume to TODAY's average only
+        # Not 20-candle historical average which could span multiple days
+        # ══════════════════════════════════════════════════════════════
+        today_avg_vol = candles["volume"].iloc[:i].mean() if i > 0 else 0
         curr_vol = candles["volume"].iloc[i]
-        vol_ok = avg_vol > 0 and curr_vol > avg_vol * 1.2
+        vol_ok = today_avg_vol > 0 and curr_vol > today_avg_vol * 1.3  # Higher threshold for intraday
 
         if not vol_ok:
             return None
@@ -1629,13 +2173,18 @@ class AdaptiveV3Trader:
         t = pd.to_datetime(row["datetime"])
 
         # Need very strong signal: RSI + VWAP + volume all aligned
+        # ══════════════════════════════════════════════════════════════
+        # INTRADAY FIX: Use intraday RSI (7 candles = 35 min, not 7 days)
+        # ══════════════════════════════════════════════════════════════
         rsi = self.strategy.compute_rsi(candles["close"].iloc[:i + 1], period=7)
         vwap, std = self.strategy.compute_vwap_proper(candles, i)
-        avg_vol = candles["volume"].iloc[max(0, i - 20):i].mean()
+        
+        # INTRADAY FIX: Compare to TODAY's average volume only
+        today_avg_vol = candles["volume"].iloc[:i].mean() if i > 0 else 0
         curr_vol = candles["volume"].iloc[i]
 
-        if avg_vol == 0 or curr_vol < avg_vol * 1.3:
-            return None  # need strong volume
+        if today_avg_vol == 0 or curr_vol < today_avg_vol * 1.3:
+            return None  # need strong volume vs TODAY's average
 
         # 5-candle trend alignment
         recent_close = candles["close"].iloc[max(0, i - 5):i + 1]
@@ -1666,15 +2215,56 @@ class AdaptiveV3Trader:
         return None
 
     def _quick_atr(self, candles, idx, period=14):
-        """ATR with a floor of 0.5% of price to prevent micro-SL disasters."""
-        if idx < period:
-            raw = (candles["high"].iloc[:idx+1] - candles["low"].iloc[:idx+1]).mean()
-        else:
-            recent = candles.iloc[max(0, idx - period):idx + 1]
-            raw = (recent["high"] - recent["low"]).mean()
+        """
+        ATR for INTRADAY trading.
+        
+        KEY CHANGE: Uses all candles from TODAY (not arbitrary lookback)
+        This ensures ATR reflects today's volatility, not historical.
+        """
+        # Use all available candles today (up to period limit)
+        lookback = min(idx + 1, period)
+        if lookback < 3:
+            lookback = idx + 1  # Use whatever we have
+        
+        recent = candles.iloc[max(0, idx - lookback + 1):idx + 1]
+        raw = (recent["high"] - recent["low"]).mean()
+        
         # Floor: ATR must be at least 0.5% of current price
         price = candles["close"].iloc[idx]
         return max(raw, price * 0.005)
+    
+    def _get_intraday_support_resistance(self, candles, idx):
+        """
+        Get support/resistance levels based on TODAY's data only.
+        
+        For intraday, multi-day S/R is less relevant than:
+        - Today's open (psychological level)
+        - Today's high/low (range bounds)
+        - VWAP (fair value)
+        """
+        if idx < 6:
+            return None, None
+        
+        # Today's levels
+        today_high = candles["high"].iloc[:idx+1].max()
+        today_low = candles["low"].iloc[:idx+1].min()
+        today_open = candles["open"].iloc[0]
+        current = candles["close"].iloc[idx]
+        
+        # VWAP as dynamic support/resistance
+        vwap, _ = self.strategy.compute_vwap_proper(candles, idx)
+        
+        # Determine support/resistance based on where price is
+        if current > vwap:
+            # Price above VWAP: VWAP is support, today's high is resistance
+            support = max(vwap, today_open) if today_open < current else vwap
+            resistance = today_high
+        else:
+            # Price below VWAP: today's low is support, VWAP is resistance
+            support = today_low
+            resistance = min(vwap, today_open) if today_open > current else vwap
+        
+        return support, resistance
 
 
 # ════════════════════════════════════════════════════════════
@@ -1722,11 +2312,19 @@ def run(symbols=None, backtest_date=None):
 
     # ── DYNAMIC MARKET TREND DETECTION ──
     trend_info = detect_market_trend(vix, target_date)
+    # Show intraday-specific trend info
+    intraday_change = trend_info.get('intraday_change_pct', 0)
+    pos_in_range = trend_info.get('position_in_range', 0.5)
     trend_msg = (
-        f"📊 MARKET TREND: {trend_info['trend']} ({trend_info['confidence']}% confidence)\n"
-        f"  LONGS: {'ENABLED' if trend_info['enable_longs'] else 'DISABLED'} (max {trend_info['max_longs']}) | "
-        f"SHORTS: {'ENABLED' if trend_info['enable_shorts'] else 'DISABLED'} (max {trend_info['max_shorts']})\n"
-        f"  Reason: {trend_info.get('reason', 'N/A')}"
+        f"📊 INTRADAY TREND: {trend_info['trend']} ({trend_info['confidence']}% confidence)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Nifty Open: ₹{trend_info.get('nifty_open', 0):,.0f}\n"
+        f"📍 Current: ₹{trend_info.get('nifty_current', 0):,.0f} ({intraday_change:+.2f}%)\n"
+        f"📊 Position in Range: {pos_in_range:.0%}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 LONGS: {'ENABLED' if trend_info['enable_longs'] else 'DISABLED'} (max {trend_info['max_longs']})\n"
+        f"🔴 SHORTS: {'ENABLED' if trend_info['enable_shorts'] else 'DISABLED'} (max {trend_info['max_shorts']})\n"
+        f"📝 {trend_info.get('reason', 'N/A')}"
     )
     logger.info(f"\n{trend_msg}")
     send_telegram(trend_msg, config)
@@ -1739,40 +2337,90 @@ def run(symbols=None, backtest_date=None):
         send_telegram(msg, config)
         return
 
-    # ── Claude Brain V2 morning analysis ──
+    # ── Claude Brain V2 with INTRADAY analysis ──
     brain = ClaudeBrainV2(config=config)
     brain_advice = None
+    intraday_brain_advice = None
+    
     if brain.enabled and not is_backtest:
-        logger.info("  🧠 Consulting Claude Brain V2...")
+        logger.info("  🧠 Consulting Claude Brain V2 (Intraday Mode)...")
+        
+        # First, get intraday-specific analysis using cached Nifty data
+        NIFTY_CACHE.refresh(force=True)
+        intraday_metrics = {
+            "nifty_open": NIFTY_CACHE.today_open,
+            "nifty_current": NIFTY_CACHE.current_price,
+            "nifty_high": NIFTY_CACHE.today_high,
+            "nifty_low": NIFTY_CACHE.today_low,
+            "intraday_change_pct": NIFTY_CACHE.intraday_change_pct,
+            "position_in_range": NIFTY_CACHE.position_in_range,
+            "vix": vix,
+            "time": datetime.now().strftime("%H:%M"),
+            "sector_performance": SECTOR_PERFORMANCE,
+        }
+        
+        intraday_brain_advice = brain.analyze_intraday_trend(intraday_metrics)
+        if intraday_brain_advice:
+            logger.info(f"  🧠 Intraday Analysis: {intraday_brain_advice.get('trend', 'N/A')} | "
+                        f"Direction: {intraday_brain_advice.get('direction', 'N/A')} | "
+                        f"Confidence: {intraday_brain_advice.get('confidence', 0)}%")
+            
+            # Use Claude's intraday direction to override global settings
+            claude_direction = intraday_brain_advice.get("direction", "NEUTRAL")
+            claude_confidence = intraday_brain_advice.get("confidence", 50)
+            
+            if claude_direction == "LONG" and claude_confidence >= 60:
+                ENABLE_LONGS = True
+                MAX_LONGS = min(MAX_LONGS + 1, 6)
+            elif claude_direction == "SHORT" and claude_confidence >= 60:
+                ENABLE_SHORTS = True
+                MAX_SHORTS = min(MAX_SHORTS + 1, 6)
+        
+        # Also get traditional morning analysis for news/sentiment
         brain_advice = brain.morning_analysis(vix=vix, stock_scores=[])
         if brain_advice:
-            logger.info(f"  🧠 Claude says: {brain_advice.get('risk_level', 'N/A')} | "
-                        f"Max trades: {brain_advice.get('max_trades', 'N/A')} | "
-                        f"Sentiment: {brain_advice.get('news_sentiment', 'N/A')} | "
-                        f"{brain_advice.get('market_outlook', '')}")
+            logger.info(f"  🧠 Morning Brief: {brain_advice.get('risk_level', 'N/A')} | "
+                        f"Sentiment: {brain_advice.get('news_sentiment', 'N/A')}")
+            
+            # Telegram with combined intraday + morning analysis
+            intraday_str = ""
+            if intraday_brain_advice:
+                intraday_str = (
+                    f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 INTRADAY ANALYSIS\n"
+                    f"Trend: {intraday_brain_advice.get('trend', 'N/A')}\n"
+                    f"Direction: {intraday_brain_advice.get('direction', 'N/A')} ({intraday_brain_advice.get('confidence', 0)}%)\n"
+                    f"Strategy: {intraday_brain_advice.get('strategy_for_now', 'N/A')}\n"
+                    f"Reasoning: {intraday_brain_advice.get('reasoning', 'N/A')}\n"
+                )
+            
             send_telegram(
                 f"🧠 Claude Brain V2 — {today_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📰 MORNING BRIEF\n"
                 f"Risk: {brain_advice.get('risk_level', 'N/A')}\n"
                 f"Sentiment: {brain_advice.get('news_sentiment', 'N/A')}\n"
                 f"Max trades: {brain_advice.get('max_trades', 'N/A')}\n"
-                f"Skip: {brain_advice.get('skip_stocks', [])}\n"
-                f"Prefer: {brain_advice.get('preferred_stocks', [])}\n"
-                f"Outlook: {brain_advice.get('market_outlook', '')}\n"
-                f"Notes: {brain_advice.get('notes', '')}",
+                f"Outlook: {brain_advice.get('market_outlook', '')}"
+                f"{intraday_str}",
                 config,
             )
             if brain_advice.get("max_trades"):
                 config["capital"]["max_trades_per_day"] = brain_advice["max_trades"]
 
-    # ── Dynamic stock selection ──
+    # ── Dynamic stock selection (EXPANDED for intraday) ──
     if symbols:
         # If specific stocks given, still score them
         picks = select_best_stocks(symbols, config, target_date, top_n=len(symbols))
     else:
-        # Scan full universe — pick best candidates
-        # V2: Expanded to Nifty 100 for more SHORT opportunities in bear markets
-        universe = get_universe("nifty100")  # was nifty50, now nifty100 for more options
-        picks = select_best_stocks(universe, config, target_date, top_n=10)  # was 8, now 10
+        # ══════════════════════════════════════════════════════════════
+        # INTRADAY: Use larger universe for more opportunities
+        # - Nifty 250 + FNO liquid stocks = ~300 stocks
+        # - More stocks = more chances to find good setups
+        # - ML model filters to best 15-20 candidates
+        # ══════════════════════════════════════════════════════════════
+        universe = get_universe("fno")  # Full universe: Nifty 250 + FNO liquid (~300 stocks)
+        picks = select_best_stocks(universe, config, target_date, top_n=15)  # Increased from 10 to 15
 
     if picks.empty:
         msg = "⚠️ No stocks passed selection criteria today."
@@ -1787,6 +2435,57 @@ def run(symbols=None, backtest_date=None):
         picks = picks[~picks["symbol"].isin(skip)]
         if len(picks) < before:
             logger.info(f"  🧠 Claude skipped {before - len(picks)} stocks: {skip}")
+    
+    # ── NEWS-BASED STOCK ADJUSTMENT (Claude Brain V2) ──
+    news_adjustment = None
+    if brain.enabled and not is_backtest and not picks.empty:
+        logger.info("  🧠 Analyzing news for stock adjustments...")
+        
+        # Get intraday metrics for context
+        intraday_metrics = {
+            "intraday_change_pct": NIFTY_CACHE.intraday_change_pct,
+            "position_in_range": NIFTY_CACHE.position_in_range,
+        }
+        
+        news_adjustment = brain.adjust_stocks_by_news(picks, intraday_metrics)
+        
+        if news_adjustment:
+            # Apply skip list from news
+            if news_adjustment.get("skip_stocks"):
+                skip_news = news_adjustment["skip_stocks"]
+                before = len(picks)
+                picks = picks[~picks["symbol"].isin(skip_news)]
+                if len(picks) < before:
+                    logger.info(f"  📰 News skip: {skip_news}")
+            
+            # Apply direction flips from news
+            if news_adjustment.get("flip_direction"):
+                for sym, new_dir in news_adjustment["flip_direction"].items():
+                    if sym in picks["symbol"].values:
+                        picks.loc[picks["symbol"] == sym, "direction"] = new_dir
+                        logger.info(f"  📰 News flip: {sym} → {new_dir}")
+            
+            # Log boost stocks
+            if news_adjustment.get("boost_stocks"):
+                logger.info(f"  📰 News boost: {news_adjustment['boost_stocks']}")
+            
+            # Log news summary
+            if news_adjustment.get("news_summary"):
+                logger.info(f"  📰 {news_adjustment['news_summary']}")
+            
+            # Send Telegram with news summary
+            if news_adjustment.get("news_summary") and news_adjustment["news_summary"] != "No news analysis available":
+                send_telegram(
+                    f"📰 NEWS ANALYSIS — {today_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Sentiment: {news_adjustment.get('market_sentiment', 'neutral').upper()}\n"
+                    f"Skip: {news_adjustment.get('skip_stocks', [])}\n"
+                    f"Boost: {news_adjustment.get('boost_stocks', [])}\n"
+                    f"Flip: {news_adjustment.get('flip_direction', {})}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{news_adjustment.get('news_summary', '')}",
+                    config,
+                )
 
     # ── Telegram: picks ──
     long_picks = len(picks[picks["direction"] == "LONG"])
@@ -1801,9 +2500,11 @@ def run(symbols=None, backtest_date=None):
     ]
     for _, r in picks.iterrows():
         arrow = "📈" if r["direction"] == "LONG" else "📉"
+        conf_str = f"{r.get('ml_confidence', 0)*100:.0f}%" if r.get('ml_confidence') else "N/A"
+        trend_str = "↑" if r.get('trend_strength') == 'strong' else "→"
         pick_lines.append(
-            f"{arrow} {r['symbol']:<10} ML:{r['ml_score']:.0f} "
-            f"ATR:{r['atr_pct']*100:.1f}% {r['direction']}"
+            f"{arrow} {r['symbol']:<10} ML:{r['ml_score']:.0f} Conf:{conf_str} "
+            f"ATR:{r['atr_pct']*100:.1f}% {trend_str} {r['direction']}"
         )
     pick_lines.append("")
     pick_lines.append(f"Limits: LONGS≤{MAX_LONGS} | SHORTS≤{MAX_SHORTS}")
@@ -1827,7 +2528,7 @@ def run(symbols=None, backtest_date=None):
         send_telegram(msg, config)
         return
 
-    # ── Create adaptive traders ──
+    # ── Create adaptive traders (with Claude Brain + ML features for intraday) ──
     traders = {}
     if is_backtest:
         # Backtest: only create traders for stocks with candles
@@ -1835,15 +2536,35 @@ def run(symbols=None, backtest_date=None):
             sym = pick["symbol"]
             if sym not in all_candles:
                 continue
+            # Extract ML features for the trader
+            ml_features = {
+                "ml_prob": pick.get("ml_prob", 0.5),
+                "ml_confidence": pick.get("ml_confidence", 0.0),
+                "volatility_ratio": pick.get("volatility_ratio", 1.0),
+                "trend_strength": pick.get("trend_strength", "weak"),
+                "optimal_window": pick.get("optimal_window", "any"),
+                "adx": pick.get("adx", 25),
+            }
             traders[sym] = AdaptiveV3Trader(
-                sym, pick["direction"], config, ml_score=pick["ml_score"]
+                sym, pick["direction"], config, ml_score=pick["ml_score"],
+                ml_features=ml_features
             )
     else:
-        # Live: create traders for ALL picks — candles will arrive via polling
+        # Live: create traders with Claude Brain + ML features for intraday decisions
         for _, pick in picks.iterrows():
             sym = pick["symbol"]
+            ml_features = {
+                "ml_prob": pick.get("ml_prob", 0.5),
+                "ml_confidence": pick.get("ml_confidence", 0.0),
+                "volatility_ratio": pick.get("volatility_ratio", 1.0),
+                "trend_strength": pick.get("trend_strength", "weak"),
+                "optimal_window": pick.get("optimal_window", "any"),
+                "adx": pick.get("adx", 25),
+            }
             traders[sym] = AdaptiveV3Trader(
-                sym, pick["direction"], config, ml_score=pick["ml_score"]
+                sym, pick["direction"], config, ml_score=pick["ml_score"],
+                claude_brain=brain if brain.enabled else None,
+                ml_features=ml_features
             )
 
     # ── Run: backtest (all candles at once) or live (polling loop) ──
@@ -1893,21 +2614,43 @@ def run(symbols=None, backtest_date=None):
                 send_telegram(status_msg, config)
                 last_status = now_t
 
-                # ── Claude Brain V2: Live adjustment every 15 min ──
+                # ── Claude Brain V2: Live INTRADAY adjustment every 15 min ──
                 if brain.enabled:
                     try:
+                        # Refresh Nifty cache for latest intraday data
+                        NIFTY_CACHE.refresh()
+                        
+                        # Build intraday-focused state
                         live_state = {
                             "time": now_t.strftime("%H:%M"),
                             "vix": vix,
                             "day_pnl": total_pnl,
                             "trades_taken": closed,
+                            # INTRADAY: Add position context for each trade
                             "open_positions": [
-                                {"symbol": s, "side": t.side, "pnl": t.day_pnl, "regime": t.current_regime}
+                                {
+                                    "symbol": s, 
+                                    "side": t.side, 
+                                    "pnl": t.day_pnl, 
+                                    "regime": t.current_regime,
+                                    "entry_price": t.entry_price,
+                                    "position_in_range": t.position_in_range,
+                                    "intraday_change": t.intraday_change_pct,
+                                }
                                 for s, t in traders.items() if t.in_trade
                             ],
                             "stock_regimes": regimes,
+                            # INTRADAY: Market context
+                            "nifty_intraday": {
+                                "change_pct": NIFTY_CACHE.intraday_change_pct,
+                                "position_in_range": NIFTY_CACHE.position_in_range,
+                                "bias": "LONG" if NIFTY_CACHE.position_in_range > 0.55 else "SHORT" if NIFTY_CACHE.position_in_range < 0.45 else "NEUTRAL",
+                            },
                         }
+                        
                         adj = brain.live_adjustment(live_state)
+                        
+                        # Handle emergency exits
                         if adj and adj.get("emergency_exits"):
                             for sym_exit in adj["emergency_exits"]:
                                 if sym_exit in traders and traders[sym_exit].in_trade:
@@ -1919,6 +2662,25 @@ def run(symbols=None, backtest_date=None):
                                             pd.to_datetime(candles_ex.iloc[-1]["datetime"]),
                                             "CLAUDE_EMERGENCY"
                                         )
+                        
+                        # Also get fresh intraday trend analysis
+                        intraday_metrics = {
+                            "nifty_open": NIFTY_CACHE.today_open,
+                            "nifty_current": NIFTY_CACHE.current_price,
+                            "nifty_high": NIFTY_CACHE.today_high,
+                            "nifty_low": NIFTY_CACHE.today_low,
+                            "intraday_change_pct": NIFTY_CACHE.intraday_change_pct,
+                            "position_in_range": NIFTY_CACHE.position_in_range,
+                            "vix": vix,
+                            "time": now_t.strftime("%H:%M"),
+                        }
+                        intraday_trend = brain.analyze_intraday_trend(intraday_metrics)
+                        
+                        if intraday_trend and intraday_trend.get("direction") != "NEUTRAL":
+                            logger.info(f"  🧠 Intraday Update: {intraday_trend.get('direction')} "
+                                       f"({intraday_trend.get('confidence', 0)}%) - "
+                                       f"{intraday_trend.get('reasoning', '')[:50]}")
+                        
                         if adj and adj.get("notes") and adj["notes"] != "No live adjustment":
                             logger.info(f"  🧠 Brain: {adj['notes']}")
                     except Exception as brain_err:
