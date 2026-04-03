@@ -403,6 +403,78 @@ class AngelBroker:
         return result
 
     # ════════════════════════════════════════════════
+    # MARGIN CALCULATOR
+    # ════════════════════════════════════════════════
+
+    def get_margin_required(self, symbol, qty, price, side="BUY", product="INTRADAY"):
+        """
+        Get actual margin required from Angel One API.
+        Returns margin in Rs, or falls back to 20% estimate if API fails.
+        """
+        if not self.is_connected():
+            # Fallback: 20% margin for large caps
+            return price * qty * 0.20
+        
+        try:
+            token = self.symbol_mapper.get_token(symbol) if self.symbol_mapper else None
+            if not token:
+                return price * qty * 0.20
+            
+            margin_params = {
+                "positions": [
+                    {
+                        "exchange": "NSE",
+                        "qty": int(qty),
+                        "price": float(price),
+                        "productType": product,
+                        "token": str(token),
+                        "tradeType": side
+                    }
+                ]
+            }
+            resp = self.smart_api.getMarginApi(margin_params)
+            if resp and resp.get("status") and resp.get("data"):
+                margin = resp["data"].get("totalMarginRequired", 0)
+                if margin > 0:
+                    logger.debug(f"Margin for {qty}x {symbol}: Rs {margin:,.0f}")
+                    return margin
+        except Exception as e:
+            logger.debug(f"Margin API failed for {symbol}: {e}")
+        
+        # Fallback: 20% margin
+        return price * qty * 0.20
+
+    def calculate_max_qty(self, symbol, price, available_capital, side="BUY", product="INTRADAY"):
+        """
+        Calculate max quantity you can buy with available capital.
+        Uses Angel One margin API to get accurate requirements.
+        """
+        # Start with estimate (20% margin)
+        estimated_qty = int(available_capital / (price * 0.20))
+        
+        if not self.is_connected() or estimated_qty <= 0:
+            return max(1, estimated_qty)
+        
+        # Binary search for actual max qty
+        low, high = 1, estimated_qty * 2
+        best_qty = 1
+        
+        for _ in range(10):  # Max 10 iterations
+            mid = (low + high) // 2
+            margin = self.get_margin_required(symbol, mid, price, side, product)
+            
+            if margin <= available_capital:
+                best_qty = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+            
+            if low > high:
+                break
+        
+        return max(1, best_qty)
+
+    # ════════════════════════════════════════════════
     # ORDER PLACEMENT
     # ════════════════════════════════════════════════
 

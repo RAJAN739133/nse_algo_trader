@@ -1136,15 +1136,27 @@ class AdaptiveV3Trader:
             risk_pct *= 0.6
 
         # ── FIX 1b: Cap max shares to limit single-trade damage ──
-        # INTRADAY MARGIN: Only 20% margin required (5x leverage for large caps)
-        # This means Rs 10,000 capital can control Rs 50,000 worth of stocks
-        INTRADAY_MARGIN_PCT = 0.20  # 20% margin for MIS/intraday
-        margin_per_share = self.entry_price * INTRADAY_MARGIN_PCT
-        
+        # INTRADAY MARGIN: Get actual margin from Angel One API (or fallback to 20%)
         self.shares = max(1, int(self.capital * risk_pct / max(risk, min_risk)))
-        # Max shares based on available margin (not full price)
-        max_shares = int(self.capital * 0.40 / margin_per_share)  # Use 40% of capital as margin
-        self.shares = min(self.shares, max_shares)
+        
+        # Use broker's margin calculator if available
+        available_margin = self.capital * 0.40  # Use 40% of capital per trade
+        if hasattr(self, 'broker') and self.broker and hasattr(self.broker, 'get_margin_required'):
+            # Get real margin from Angel One
+            margin_for_one = self.broker.get_margin_required(
+                self.symbol, 1, self.entry_price, self.side, "INTRADAY"
+            )
+            if margin_for_one > 0:
+                max_shares = int(available_margin / margin_for_one)
+                logger.debug(f"  {self.symbol}: Margin/share Rs {margin_for_one:.0f}, max {max_shares} shares")
+            else:
+                max_shares = int(available_margin / (self.entry_price * 0.20))
+        else:
+            # Fallback: 20% margin for MIS/intraday
+            margin_per_share = self.entry_price * 0.20
+            max_shares = int(available_margin / margin_per_share)
+        
+        self.shares = min(self.shares, max(1, max_shares))
 
         # ── FIX 5: Minimum expected profit filter — skip if profit won't cover costs ──
         expected_gross = abs(self.tgt - self.entry_price) * self.shares
