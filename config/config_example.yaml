@@ -9,11 +9,17 @@ zerodha:
   # Access token is generated daily via login — handled by the code
 
 capital:
-  total: 100000          # Total capital in INR
-  risk_per_trade: 0.01   # 1% max risk per trade
-  max_trades_per_day: 2
-  daily_loss_limit: 0.03 # 3% daily loss limit — stop trading
+  total: 10000           # Total capital in INR (₹10K starting capital)
+  risk_per_trade: 0.02   # 2% max risk per trade (₹200 max per trade)
+  max_trades_per_day: 3  # Conservative for small capital
+  daily_loss_limit: 0.03 # 3% daily loss limit (₹300) — stop trading
   weekly_loss_limit: 0.07
+
+# ── Stock Universe ──
+# Options: nifty50, nifty100, nifty250, fno (full universe ~300 stocks)
+# For intraday, 'fno' is recommended for maximum opportunities
+universe: "fno"
+top_stocks: 15           # Number of stocks to select for trading
 
 trading:
   mode: "paper"          # "paper" or "live"
@@ -28,7 +34,7 @@ trading:
 strategies:
   orb:
     enabled: true
-    orb_period_minutes: 15     # First 15-min candle
+    orb_period_minutes: 30     # 30-min opening range (6 x 5-min candles)
     volume_multiplier: 1.5     # Entry needs 1.5x avg volume
     atr_stop_multiplier: 1.5   # Stop at 1.5x ATR
     trail_after_rr: 1.5        # Start trailing after 1.5x R
@@ -36,10 +42,37 @@ strategies:
 
   vwap:
     enabled: true
-    entry_band: 1.0            # Enter at VWAP ± 1 sigma
-    stop_band: 2.0             # Stop at VWAP ± 2 sigma
-    target_band: 0.0           # Target = VWAP itself
-    min_volume_percentile: 60  # Only trade when volume > 60th percentile
+    entry_sigma: 2.0           # Entry at VWAP ± 2 sigma (stricter)
+    stop_sigma: 1.0            # Tighter stop
+    require_rsi: true          # Require RSI confirmation (< 25 or > 75)
+    require_macd: true         # Require MACD turning
+    require_volume_spike: true # Require 1.5x volume spike
+
+  # ── NEW INTRADAY STRATEGIES ──
+  ema_crossover:
+    enabled: true
+    fast_period: 9             # EMA 9 (~45 min for 5-min candles)
+    slow_period: 21            # EMA 21 (~105 min)
+    require_macd: true         # MACD confirmation
+    
+  bollinger_bands:
+    enabled: true
+    period: 20                 # 20 candles (~100 min)
+    std_dev: 2.0               # 2 standard deviations
+    max_bandwidth: 0.03        # Don't trade if bands > 3% (trending)
+    require_reversal: true     # Require candle reversal pattern
+    
+  macd:
+    enabled: true
+    fast: 12                   # ~1 hour for 5-min candles
+    slow: 26                   # ~2 hours
+    signal: 9                  # ~45 min
+    require_vwap: true         # Require price above/below VWAP
+    
+  momentum:
+    enabled: true
+    lookback: 8                # 8 candles (~40 min)
+    min_change_pct: 0.5        # 0.5% minimum move
 
 filters:
   min_avg_volume: 1000000      # 10L shares minimum avg daily volume

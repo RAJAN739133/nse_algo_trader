@@ -1,5 +1,5 @@
 """
-Claude Brain V2 — Live Adaptive AI Strategy Engine
+Claude Brain V2 — Live Adaptive AI Strategy Engine (INTRADAY FOCUSED)
 
 Unlike V1 (morning-only), V2 is called THROUGHOUT the trading day:
   1. PRE-MARKET (8:50 AM): Morning brief + risk level + stock picks
@@ -7,6 +7,13 @@ Unlike V1 (morning-only), V2 is called THROUGHOUT the trading day:
   3. FULL SCAN (every 15 min): Deep analysis with news, adjust strategies
   4. NON-MARKET (every 6 hours): News scan, next-day preparation
   5. POST-MARKET (3:30 PM): EOD analysis, learn from today's mistakes
+
+INTRADAY FOCUS:
+  - All analysis uses TODAY's data only (not historical daily data)
+  - Reference price = TODAY'S OPEN (not yesterday's close)
+  - Position in TODAY's range determines direction
+  - Support/Resistance = TODAY's high/low + VWAP
+  - Volume comparison = vs TODAY's average
 
 Features:
   - Reads ML model scores and adjusts confidence per stock
@@ -154,8 +161,16 @@ class ClaudeBrainV2:
     Makes Claude aware of ML model, news, positions, and past trades.
     """
 
-    SYSTEM_PROMPT = """You are an expert NSE India intraday trading analyst AI embedded inside an algo trading bot.
+    SYSTEM_PROMPT = """You are an expert NSE India INTRADAY trading analyst AI embedded inside an algo trading bot.
 You analyze real-time data and provide actionable JSON responses.
+
+CRITICAL INTRADAY RULES:
+- ALL analysis uses TODAY's data only — ignore yesterday's close
+- Reference price = TODAY'S OPEN (first candle open price)
+- Direction = WHERE price IS in TODAY's range (not historical trend)
+- Support = TODAY's low, VWAP when price above it
+- Resistance = TODAY's high, VWAP when price below it
+- Volume comparison = vs TODAY's average, not historical
 
 KEY RULES:
 - You ONLY suggest adjustments within safety limits
@@ -164,7 +179,12 @@ KEY RULES:
 - Max trades per day: 5
 - You always return valid JSON, nothing else
 - Be specific with numbers: exact stop loss levels, exact position sizes
-- When suggesting strategy changes, explain WHY briefly"""
+- When suggesting strategy changes, explain WHY briefly
+
+INTRADAY METRICS TO CONSIDER:
+- intraday_change_pct: % change from today's open
+- position_in_range: 0=at day low, 1=at day high
+- today_open, today_high, today_low: key intraday levels"""
 
     def __init__(self, config=None):
         self.api_key = ""
@@ -252,22 +272,49 @@ ML MODEL INFO: {json.dumps(ml_model_info or {}, default=str)}
 Analyze everything above and return JSON:
 {{
   "risk_level": "conservative|normal|aggressive",
-  "max_trades": 2,
+  "max_trades": 3,
+  "risk_per_trade_pct": 0.02,
+  "position_size_factor": 1.0,
   "skip_stocks": ["SYM1"],
   "preferred_stocks": ["SYM1", "SYM2"],
   "stock_directions": {{"RELIANCE": "SHORT", "SBIN": "LONG"}},
   "strategy_tweaks": {{
     "orb_atr_multiplier": 1.5,
+    "target_pct": 0.01,
+    "stop_pct": 0.005,
+    "quick_profit_pct": 0.008,
+    "cut_loss_pct": 0.004,
+    "trailing_activation_pct": 0.005,
+    "time_decay_candles": 24,
     "widen_stops_pct": 0,
     "prefer_momentum_over_orb": false,
-    "avoid_afternoon_trades": false,
-    "time_decay_minutes": 45
+    "avoid_afternoon_trades": false
+  }},
+  "entry_filters": {{
+    "min_ml_confidence": 0.12,
+    "blocked_regimes": ["ranging", "unknown"],
+    "enable_longs": true,
+    "enable_shorts": true,
+    "max_longs": 5,
+    "max_shorts": 5
   }},
   "news_sentiment": "bullish|bearish|neutral",
   "market_outlook": "brief 1 line",
   "avoid_sectors": [],
   "notes": "brief reasoning"
-}}"""
+}}
+
+DYNAMIC PARAMETERS GUIDE (VIX-based):
+- VIX < 15: max_trades=5, risk=3%, target=1.5%, stop=0.8%, quick_profit=1.2%
+- VIX 15-20: max_trades=4, risk=2.5%, target=1.2%, stop=0.6%, quick_profit=1.0%
+- VIX 20-25: max_trades=3, risk=2%, target=1.0%, stop=0.5%, quick_profit=0.8%
+- VIX 25-30: max_trades=2, risk=1.5%, target=0.8%, stop=0.4%, quick_profit=0.6%
+- VIX > 30: max_trades=1, risk=1%, target=0.6%, stop=0.3%, quick_profit=0.5%
+
+DIRECTION RULES (news-based):
+- Bearish news: enable_shorts=true, max_shorts=5, max_longs=2
+- Bullish news: enable_longs=true, max_longs=5, max_shorts=2
+- Mixed/neutral: both enabled, balanced"""
 
         result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=1000)
         return self._validate_morning(result, vix) if result else self._default_morning(vix)
@@ -417,13 +464,149 @@ Rules:
         return self._validate_live(result) if result else self._default_live()
 
     # ════════════════════════════════════════════════
-    # 4. MARKET TREND ANALYSIS
+    # 4. INTRADAY MARKET TREND ANALYSIS (NEW!)
     # ════════════════════════════════════════════════
+
+    def analyze_intraday_trend(self, intraday_metrics):
+        """
+        Analyze market trend using INTRADAY data only.
+        This is the KEY method for intraday trading decisions.
+        
+        Args:
+            intraday_metrics: dict with:
+                - nifty_open: Today's Nifty open price
+                - nifty_current: Current Nifty price
+                - nifty_high: Today's Nifty high
+                - nifty_low: Today's Nifty low
+                - intraday_change_pct: % change from today's open
+                - position_in_range: 0-1 (where price is in today's range)
+                - vix: Current VIX level
+                - time: Current time (HH:MM)
+                - sector_performance: {sector: % change today}
+        
+        Returns:
+            - trend: bullish/bearish/sideways
+            - direction: LONG/SHORT/NEUTRAL
+            - confidence: 0-100
+            - key_levels: {support, resistance, vwap_estimate}
+            - strategy_for_now: which strategy to use
+        """
+        if not self.enabled:
+            return self._default_intraday_trend(intraday_metrics)
+        
+        prompt = f"""INTRADAY MARKET ANALYSIS — {intraday_metrics.get('time', 'N/A')}
+
+CRITICAL: Use ONLY today's data for analysis. Ignore any historical daily trends.
+
+TODAY'S NIFTY DATA:
+- Open: {intraday_metrics.get('nifty_open', 'N/A')}
+- Current: {intraday_metrics.get('nifty_current', 'N/A')}
+- High: {intraday_metrics.get('nifty_high', 'N/A')}
+- Low: {intraday_metrics.get('nifty_low', 'N/A')}
+- Change from Open: {intraday_metrics.get('intraday_change_pct', 0):+.2f}%
+- Position in Range: {intraday_metrics.get('position_in_range', 0.5):.0%} (0%=at low, 100%=at high)
+
+VIX: {intraday_metrics.get('vix', 'N/A')}
+
+SECTOR PERFORMANCE TODAY:
+{json.dumps(intraday_metrics.get('sector_performance', {}), default=str)}
+
+Based on WHERE price IS in today's range (not historical trend), determine:
+
+Return JSON:
+{{
+  "trend": "bullish|bearish|sideways",
+  "direction": "LONG|SHORT|NEUTRAL",
+  "confidence": 75,
+  "reasoning": "Position in upper/lower range, momentum direction",
+  "key_levels": {{
+    "support": {intraday_metrics.get('nifty_low', 0)},
+    "resistance": {intraday_metrics.get('nifty_high', 0)},
+    "pivot": 0
+  }},
+  "strategy_for_now": "ORB|MOMENTUM|VWAP|AFTERNOON_TREND|WAIT",
+  "position_size_factor": 1.0,
+  "sector_focus": ["IT", "Banking"],
+  "sector_avoid": [],
+  "time_based_advice": "specific advice based on current time",
+  "risk_level": "low|medium|high"
+}}
+
+INTRADAY RULES:
+- Position in range > 60% = BULLISH bias (LONG preferred)
+- Position in range < 40% = BEARISH bias (SHORT preferred)
+- 40-60% = NEUTRAL (wait or use VWAP mean reversion)
+- Morning (9:15-11:00): ORB/MOMENTUM strategies
+- Midday (11:00-13:00): VWAP/MOMENTUM strategies
+- Afternoon (13:00-14:30): AFTERNOON_TREND only with strong signals
+- After 14:30: Reduce new entries, manage existing positions"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=700)
+        if result:
+            return self._validate_intraday_trend(result, intraday_metrics)
+        return self._default_intraday_trend(intraday_metrics)
+    
+    def _validate_intraday_trend(self, result, metrics):
+        """Validate and enhance intraday trend analysis."""
+        v = result.copy()
+        
+        # Ensure key fields exist
+        v["confidence"] = max(0, min(100, v.get("confidence", 50)))
+        v["position_size_factor"] = max(0.3, min(1.5, v.get("position_size_factor", 1.0)))
+        
+        # Auto-adjust based on position in range if Claude missed it
+        pos = metrics.get("position_in_range", 0.5)
+        if pos > 0.7 and v.get("direction") == "SHORT":
+            v["confidence"] = max(30, v["confidence"] - 20)
+            v["warning"] = "Direction contradicts position in range"
+        elif pos < 0.3 and v.get("direction") == "LONG":
+            v["confidence"] = max(30, v["confidence"] - 20)
+            v["warning"] = "Direction contradicts position in range"
+        
+        v["validated"] = True
+        return v
+    
+    def _default_intraday_trend(self, metrics):
+        """Default intraday trend based on simple rules."""
+        pos = metrics.get("position_in_range", 0.5)
+        change = metrics.get("intraday_change_pct", 0)
+        
+        if pos > 0.6 and change > 0.3:
+            trend = "bullish"
+            direction = "LONG"
+            confidence = min(80, 50 + pos * 30)
+        elif pos < 0.4 and change < -0.3:
+            trend = "bearish"
+            direction = "SHORT"
+            confidence = min(80, 50 + (1 - pos) * 30)
+        else:
+            trend = "sideways"
+            direction = "NEUTRAL"
+            confidence = 50
+        
+        return {
+            "trend": trend,
+            "direction": direction,
+            "confidence": confidence,
+            "reasoning": f"Position in range: {pos:.0%}, intraday change: {change:+.2f}%",
+            "key_levels": {
+                "support": metrics.get("nifty_low", 0),
+                "resistance": metrics.get("nifty_high", 0),
+            },
+            "strategy_for_now": "MOMENTUM" if abs(change) > 0.5 else "VWAP",
+            "position_size_factor": 1.0,
+            "sector_focus": [],
+            "sector_avoid": [],
+            "risk_level": "medium",
+            "validated": True,
+        }
 
     def analyze_market_trend(self, nifty_data=None, vix=None, sector_data=None):
         """
         Analyze overall market trend and suggest strategy adjustments.
         Called periodically to understand market direction.
+        
+        NOTE: For intraday trading, prefer analyze_intraday_trend() instead.
         
         Returns:
         - trend: bullish/bearish/sideways
@@ -485,13 +668,133 @@ Return JSON:
         }
 
     # ════════════════════════════════════════════════
-    # 5. STOCK ANALYSIS (on-demand)
+    # 5. STOCK ANALYSIS (on-demand) — INTRADAY FOCUSED
     # ════════════════════════════════════════════════
+
+    def analyze_stock_intraday(self, symbol, intraday_data, market_bias, regime, news=None):
+        """
+        INTRADAY-focused analysis of a single stock before entry.
+        Uses today's price action, not historical data.
+        
+        Args:
+            symbol: Stock symbol
+            intraday_data: dict with today's data:
+                - today_open: Stock's opening price today
+                - current_price: Current price
+                - today_high: Today's high
+                - today_low: Today's low
+                - intraday_change_pct: % change from today's open
+                - position_in_range: 0-1 (where price is in today's range)
+                - volume_vs_avg: Current volume vs today's average
+                - vwap: Today's VWAP
+            market_bias: LONG/SHORT/NEUTRAL from Nifty analysis
+            regime: trending_up/trending_down/ranging/volatile/choppy
+
+        Returns:
+        - take_trade: bool
+        - direction: LONG/SHORT
+        - confidence: 0-100
+        - entry_price: suggested entry
+        - stop_loss: based on today's levels
+        - target: based on today's levels
+        - reason: str
+        """
+        if not self.enabled:
+            return self._default_stock_intraday(intraday_data, market_bias)
+
+        stock_news = _fetch_market_news([symbol]) if not news else news
+        news_text = "\n".join([f"- {n['title']}" for n in stock_news[:3]]) or "No recent news"
+
+        prompt = f"""INTRADAY TRADE DECISION: {symbol}
+
+TODAY'S STOCK DATA (use ONLY this for analysis):
+- Open: ₹{intraday_data.get('today_open', 'N/A')}
+- Current: ₹{intraday_data.get('current_price', 'N/A')}
+- High: ₹{intraday_data.get('today_high', 'N/A')}
+- Low: ₹{intraday_data.get('today_low', 'N/A')}
+- Change from Open: {intraday_data.get('intraday_change_pct', 0):+.2f}%
+- Position in Range: {intraday_data.get('position_in_range', 0.5):.0%}
+- Volume vs Today Avg: {intraday_data.get('volume_vs_avg', 1.0):.1f}x
+- VWAP: ₹{intraday_data.get('vwap', 'N/A')}
+
+MARKET CONTEXT:
+- Nifty Bias: {market_bias}
+- Stock Regime: {regime}
+
+Recent News:
+{news_text}
+
+Past Performance:
+{self._get_stock_history(symbol)}
+
+INTRADAY ENTRY RULES:
+- Direction should ALIGN with market_bias (don't fight the market)
+- Position in range > 55% + market LONG = LONG trade
+- Position in range < 45% + market SHORT = SHORT trade
+- Stop loss = today's low (LONG) or today's high (SHORT)
+- Target = opposite end of today's range or VWAP
+
+Should I take this trade? Return JSON:
+{{
+  "take_trade": true,
+  "direction": "LONG|SHORT",
+  "confidence": 75,
+  "entry_price": {intraday_data.get('current_price', 0)},
+  "stop_loss": 0,
+  "target": 0,
+  "position_size_factor": 1.0,
+  "reason": "brief explanation using intraday logic"
+}}"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=500)
+        if result:
+            result["take_trade"] = result.get("take_trade", True)
+            result["confidence"] = max(0, min(100, result.get("confidence", 50)))
+            return result
+        return self._default_stock_intraday(intraday_data, market_bias)
+    
+    def _default_stock_intraday(self, data, market_bias):
+        """Default stock analysis based on intraday rules."""
+        pos = data.get("position_in_range", 0.5)
+        current = data.get("current_price", 0)
+        today_low = data.get("today_low", current * 0.99)
+        today_high = data.get("today_high", current * 1.01)
+        vwap = data.get("vwap", current)
+        
+        # Direction based on position in range + market bias
+        if pos > 0.55 and market_bias == "LONG":
+            direction = "LONG"
+            stop_loss = today_low * 0.998
+            target = today_high * 0.998 if today_high > current else current * 1.01
+            take_trade = True
+        elif pos < 0.45 and market_bias == "SHORT":
+            direction = "SHORT"
+            stop_loss = today_high * 1.002
+            target = today_low * 1.002 if today_low < current else current * 0.99
+            take_trade = True
+        else:
+            direction = "NEUTRAL"
+            stop_loss = 0
+            target = 0
+            take_trade = False
+        
+        return {
+            "take_trade": take_trade,
+            "direction": direction,
+            "confidence": 50,
+            "entry_price": current,
+            "stop_loss": stop_loss,
+            "target": target,
+            "position_size_factor": 1.0,
+            "reason": f"Position {pos:.0%}, bias {market_bias}",
+        }
 
     def analyze_stock(self, symbol, candle_summary, ml_score, direction, regime, news=None):
         """
         Deep analysis of a single stock before entry.
         Called when a signal is generated but before execution.
+        
+        NOTE: For pure intraday, prefer analyze_stock_intraday() instead.
 
         Returns:
         - take_trade: bool
@@ -535,7 +838,7 @@ Should I take this trade? Return JSON:
         return {"take_trade": True, "confidence": 50, "reason": "API unavailable"}
 
     # ════════════════════════════════════════════════
-    # 4. NEWS-BASED DIRECTION OVERRIDE
+    # 4. NEWS-BASED DIRECTION OVERRIDE + STOCK ADJUSTMENT
     # ════════════════════════════════════════════════
 
     def news_direction_check(self, symbols):
@@ -572,6 +875,125 @@ strength: 1-3 = weak signal, 4-6 = moderate, 7-10 = strong (earnings, FDA, major
         if result and isinstance(result, dict):
             return {k: v for k, v in result.items() if k in symbols}
         return {}
+
+    def adjust_stocks_by_news(self, stock_picks, intraday_metrics=None):
+        """
+        Adjust stock selection based on news analysis.
+        This is the KEY method for news-driven stock filtering.
+        
+        Args:
+            stock_picks: DataFrame with columns [symbol, direction, ml_score, ...]
+            intraday_metrics: dict with Nifty intraday data
+        
+        Returns:
+            dict with:
+            - adjusted_picks: list of adjusted stock recommendations
+            - skip_stocks: list of stocks to avoid (bad news)
+            - flip_direction: dict of stocks to flip direction
+            - boost_stocks: list of stocks to prioritize (good news)
+            - news_summary: brief news summary
+        """
+        if not self.enabled:
+            return self._default_news_adjustment(stock_picks)
+        
+        symbols = stock_picks["symbol"].tolist() if hasattr(stock_picks, "symbol") else []
+        if not symbols:
+            return self._default_news_adjustment(stock_picks)
+        
+        # Fetch news for all symbols
+        news = _fetch_market_news(symbols)
+        if not news:
+            return self._default_news_adjustment(stock_picks)
+        
+        news_text = "\n".join([f"- {n['title']} ({n['source']})" for n in news[:15]])
+        
+        # Build current picks summary
+        picks_summary = []
+        for _, row in stock_picks.iterrows():
+            picks_summary.append({
+                "symbol": row.get("symbol"),
+                "direction": row.get("direction"),
+                "ml_score": row.get("ml_score"),
+            })
+        
+        intraday_str = ""
+        if intraday_metrics:
+            intraday_str = f"""
+INTRADAY CONTEXT:
+- Nifty Change: {intraday_metrics.get('intraday_change_pct', 0):+.2f}%
+- Position in Range: {intraday_metrics.get('position_in_range', 0.5):.0%}
+- Market Bias: {'BULLISH' if intraday_metrics.get('position_in_range', 0.5) > 0.55 else 'BEARISH' if intraday_metrics.get('position_in_range', 0.5) < 0.45 else 'NEUTRAL'}
+"""
+        
+        prompt = f"""STOCK SELECTION ADJUSTMENT — News-Based
+
+CURRENT STOCK PICKS:
+{json.dumps(picks_summary, indent=2)}
+{intraday_str}
+LATEST NEWS:
+{news_text}
+
+Analyze the news and adjust stock selection:
+
+1. SKIP any stock with NEGATIVE news (earnings miss, fraud, downgrade)
+2. FLIP direction if news contradicts ML direction (e.g., ML says SHORT but earnings beat)
+3. BOOST stocks with strong POSITIVE news (earnings beat, upgrade, deal)
+4. Consider news recency — today's news > yesterday's
+
+Return JSON:
+{{
+  "skip_stocks": ["SYM1"],
+  "flip_direction": {{"SYM2": "LONG"}},
+  "boost_stocks": ["SYM3"],
+  "reduce_position": {{"SYM4": 0.5}},
+  "news_summary": "Brief summary of key news affecting trading today",
+  "sector_news": {{
+    "IT": "positive|negative|neutral",
+    "Banking": "positive|negative|neutral"
+  }},
+  "market_sentiment": "bullish|bearish|neutral",
+  "confidence": 75
+}}
+
+Rules:
+- Only include stocks from the picks list
+- flip_direction: change to opposite direction
+- reduce_position: factor to multiply position size (0.5 = half size)
+- Be conservative — only act on clear news signals"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=800)
+        
+        if result:
+            return self._validate_news_adjustment(result, symbols)
+        return self._default_news_adjustment(stock_picks)
+    
+    def _validate_news_adjustment(self, result, valid_symbols):
+        """Validate news adjustment results."""
+        v = result.copy()
+        
+        # Ensure only valid symbols
+        v["skip_stocks"] = [s for s in v.get("skip_stocks", []) if s in valid_symbols]
+        v["flip_direction"] = {k: v for k, v in v.get("flip_direction", {}).items() if k in valid_symbols}
+        v["boost_stocks"] = [s for s in v.get("boost_stocks", []) if s in valid_symbols]
+        v["reduce_position"] = {k: max(0.3, min(1.0, v)) for k, v in v.get("reduce_position", {}).items() if k in valid_symbols}
+        v["confidence"] = max(0, min(100, v.get("confidence", 50)))
+        v["validated"] = True
+        
+        return v
+    
+    def _default_news_adjustment(self, stock_picks):
+        """Default news adjustment (no changes)."""
+        return {
+            "skip_stocks": [],
+            "flip_direction": {},
+            "boost_stocks": [],
+            "reduce_position": {},
+            "news_summary": "No news analysis available",
+            "sector_news": {},
+            "market_sentiment": "neutral",
+            "confidence": 50,
+            "validated": True,
+        }
 
     # ════════════════════════════════════════════════
     # 5. DYNAMIC STRATEGY CREATION
@@ -723,10 +1145,38 @@ Return JSON:
         if vix > SAFETY_LIMITS["vix_absolute_skip"]:
             v["risk_level"] = "skip"
             v["max_trades"] = 0
-        v["max_trades"] = min(v.get("max_trades", 2), SAFETY_LIMITS["max_trades_per_day"])
+            v["risk_per_trade_pct"] = 0.01
+        
+        # Validate max_trades within safety limits
+        v["max_trades"] = min(v.get("max_trades", 3), SAFETY_LIMITS["max_trades_per_day"])
+        
+        # Validate risk_per_trade within safety limits (0.5% to 3%)
+        v["risk_per_trade_pct"] = max(0.005, min(0.03, v.get("risk_per_trade_pct", 0.02)))
+        
+        # Validate position_size_factor (0.3 to 1.5)
+        v["position_size_factor"] = max(0.3, min(1.5, v.get("position_size_factor", 1.0)))
+        
+        # Validate strategy_tweaks
         tweaks = v.get("strategy_tweaks", {})
         tweaks["orb_atr_multiplier"] = max(1.0, min(2.5, tweaks.get("orb_atr_multiplier", 1.5)))
+        tweaks["target_pct"] = max(0.005, min(0.02, tweaks.get("target_pct", 0.01)))
+        tweaks["stop_pct"] = max(0.003, min(0.01, tweaks.get("stop_pct", 0.005)))
+        tweaks["quick_profit_pct"] = max(0.004, min(0.015, tweaks.get("quick_profit_pct", 0.008)))
+        tweaks["cut_loss_pct"] = max(0.002, min(0.008, tweaks.get("cut_loss_pct", 0.004)))
+        tweaks["trailing_activation_pct"] = max(0.003, min(0.01, tweaks.get("trailing_activation_pct", 0.005)))
+        tweaks["time_decay_candles"] = max(12, min(36, tweaks.get("time_decay_candles", 24)))
         v["strategy_tweaks"] = tweaks
+        
+        # Validate entry_filters
+        filters = v.get("entry_filters", {})
+        filters["min_ml_confidence"] = max(0.05, min(0.25, filters.get("min_ml_confidence", 0.12)))
+        filters["enable_longs"] = filters.get("enable_longs", True)
+        filters["enable_shorts"] = filters.get("enable_shorts", True)
+        filters["max_longs"] = max(1, min(10, filters.get("max_longs", 5)))
+        filters["max_shorts"] = max(1, min(10, filters.get("max_shorts", 5)))
+        filters["blocked_regimes"] = filters.get("blocked_regimes", ["ranging", "unknown"])
+        v["entry_filters"] = filters
+        
         v["validated"] = True
         return v
 
@@ -739,19 +1189,180 @@ Return JSON:
         return v
 
     def _default_morning(self, vix):
-        level = "conservative" if vix > 20 else ("aggressive" if vix < 14 else "normal")
-        return {
-            "risk_level": level,
-            "max_trades": 2,
-            "skip_stocks": [],
-            "preferred_stocks": [],
-            "stock_directions": {},
-            "strategy_tweaks": {"orb_atr_multiplier": 1.5},
-            "news_sentiment": "neutral",
-            "market_outlook": f"Default mode, VIX={vix:.1f}",
-            "notes": "Claude unavailable, using defaults",
-            "validated": True,
-        }
+        """
+        VIX-based defaults when Claude API is unavailable.
+        These mirror what Claude would return for each VIX level.
+        """
+        if vix < 15:
+            return {
+                "risk_level": "aggressive",
+                "max_trades": 5,
+                "risk_per_trade_pct": 0.03,
+                "position_size_factor": 1.0,
+                "skip_stocks": [],
+                "preferred_stocks": [],
+                "stock_directions": {},
+                "strategy_tweaks": {
+                    "orb_atr_multiplier": 1.8,
+                    "target_pct": 0.015,
+                    "stop_pct": 0.008,
+                    "quick_profit_pct": 0.012,
+                    "cut_loss_pct": 0.005,
+                    "trailing_activation_pct": 0.006,
+                    "time_decay_candles": 30,
+                    "widen_stops_pct": 0,
+                    "prefer_momentum_over_orb": True,
+                    "avoid_afternoon_trades": False
+                },
+                "entry_filters": {
+                    "min_ml_confidence": 0.10,
+                    "blocked_regimes": ["unknown"],
+                    "enable_longs": True,
+                    "enable_shorts": True,
+                    "max_longs": 5,
+                    "max_shorts": 5
+                },
+                "news_sentiment": "neutral",
+                "market_outlook": f"Low VIX ({vix:.1f}) - aggressive mode, wider targets",
+                "notes": "Claude unavailable, using VIX-based defaults",
+                "validated": True,
+            }
+        elif vix < 20:
+            return {
+                "risk_level": "normal",
+                "max_trades": 4,
+                "risk_per_trade_pct": 0.025,
+                "position_size_factor": 1.0,
+                "skip_stocks": [],
+                "preferred_stocks": [],
+                "stock_directions": {},
+                "strategy_tweaks": {
+                    "orb_atr_multiplier": 1.5,
+                    "target_pct": 0.012,
+                    "stop_pct": 0.006,
+                    "quick_profit_pct": 0.010,
+                    "cut_loss_pct": 0.004,
+                    "trailing_activation_pct": 0.005,
+                    "time_decay_candles": 24,
+                    "widen_stops_pct": 0,
+                    "prefer_momentum_over_orb": False,
+                    "avoid_afternoon_trades": False
+                },
+                "entry_filters": {
+                    "min_ml_confidence": 0.12,
+                    "blocked_regimes": ["ranging", "unknown"],
+                    "enable_longs": True,
+                    "enable_shorts": True,
+                    "max_longs": 4,
+                    "max_shorts": 4
+                },
+                "news_sentiment": "neutral",
+                "market_outlook": f"Normal VIX ({vix:.1f}) - balanced approach",
+                "notes": "Claude unavailable, using VIX-based defaults",
+                "validated": True,
+            }
+        elif vix < 25:
+            return {
+                "risk_level": "conservative",
+                "max_trades": 3,
+                "risk_per_trade_pct": 0.02,
+                "position_size_factor": 0.8,
+                "skip_stocks": [],
+                "preferred_stocks": [],
+                "stock_directions": {},
+                "strategy_tweaks": {
+                    "orb_atr_multiplier": 1.3,
+                    "target_pct": 0.010,
+                    "stop_pct": 0.005,
+                    "quick_profit_pct": 0.008,
+                    "cut_loss_pct": 0.004,
+                    "trailing_activation_pct": 0.005,
+                    "time_decay_candles": 20,
+                    "widen_stops_pct": 0,
+                    "prefer_momentum_over_orb": False,
+                    "avoid_afternoon_trades": True
+                },
+                "entry_filters": {
+                    "min_ml_confidence": 0.15,
+                    "blocked_regimes": ["ranging", "unknown", "choppy"],
+                    "enable_longs": True,
+                    "enable_shorts": True,
+                    "max_longs": 3,
+                    "max_shorts": 3
+                },
+                "news_sentiment": "neutral",
+                "market_outlook": f"Elevated VIX ({vix:.1f}) - conservative, tighter stops",
+                "notes": "Claude unavailable, using VIX-based defaults",
+                "validated": True,
+            }
+        elif vix < 30:
+            return {
+                "risk_level": "defensive",
+                "max_trades": 2,
+                "risk_per_trade_pct": 0.015,
+                "position_size_factor": 0.6,
+                "skip_stocks": [],
+                "preferred_stocks": [],
+                "stock_directions": {},
+                "strategy_tweaks": {
+                    "orb_atr_multiplier": 1.2,
+                    "target_pct": 0.008,
+                    "stop_pct": 0.004,
+                    "quick_profit_pct": 0.006,
+                    "cut_loss_pct": 0.003,
+                    "trailing_activation_pct": 0.004,
+                    "time_decay_candles": 16,
+                    "widen_stops_pct": 0,
+                    "prefer_momentum_over_orb": False,
+                    "avoid_afternoon_trades": True
+                },
+                "entry_filters": {
+                    "min_ml_confidence": 0.18,
+                    "blocked_regimes": ["ranging", "unknown", "choppy", "volatile"],
+                    "enable_longs": True,
+                    "enable_shorts": True,
+                    "max_longs": 2,
+                    "max_shorts": 2
+                },
+                "news_sentiment": "cautious",
+                "market_outlook": f"High VIX ({vix:.1f}) - defensive, quick exits",
+                "notes": "Claude unavailable, using VIX-based defaults",
+                "validated": True,
+            }
+        else:
+            return {
+                "risk_level": "minimal",
+                "max_trades": 1,
+                "risk_per_trade_pct": 0.01,
+                "position_size_factor": 0.5,
+                "skip_stocks": [],
+                "preferred_stocks": [],
+                "stock_directions": {},
+                "strategy_tweaks": {
+                    "orb_atr_multiplier": 1.0,
+                    "target_pct": 0.006,
+                    "stop_pct": 0.003,
+                    "quick_profit_pct": 0.005,
+                    "cut_loss_pct": 0.002,
+                    "trailing_activation_pct": 0.003,
+                    "time_decay_candles": 12,
+                    "widen_stops_pct": 0,
+                    "prefer_momentum_over_orb": False,
+                    "avoid_afternoon_trades": True
+                },
+                "entry_filters": {
+                    "min_ml_confidence": 0.20,
+                    "blocked_regimes": ["ranging", "unknown", "choppy", "volatile"],
+                    "enable_longs": False,
+                    "enable_shorts": True,
+                    "max_longs": 1,
+                    "max_shorts": 2
+                },
+                "news_sentiment": "bearish",
+                "market_outlook": f"Extreme VIX ({vix:.1f}) - minimal exposure, SHORT bias",
+                "notes": "Claude unavailable, using VIX-based defaults",
+                "validated": True,
+            }
 
     def _default_live(self):
         return {
@@ -768,3 +1379,235 @@ Return JSON:
 
     def get_api_usage(self):
         return {"calls_today": _get_api_call_count(), "limit": SAFETY_LIMITS["max_api_calls_per_day"]}
+    
+    # ════════════════════════════════════════════════
+    # 7. GAP & EVENT ANALYSIS (Morning Pre-Market)
+    # ════════════════════════════════════════════════
+    
+    def analyze_gaps(self, gap_data: list, events: dict = None):
+        """
+        Analyze overnight gaps and decide which to trade.
+        Called at 9:10 AM after opening prices are available.
+        
+        Args:
+            gap_data: List of dicts with symbol, gap_pct, gap_type, prev_trend
+            events: Event calendar data (earnings, RBI, etc.)
+        
+        Returns:
+            Dict with approved gaps, rejected gaps, and trading parameters
+        """
+        if not self.enabled:
+            return self._default_gap_analysis(gap_data)
+        
+        # Rate limit
+        now = datetime.now()
+        
+        prompt = f"""MORNING GAP ANALYSIS — {now.strftime('%Y-%m-%d %H:%M')}
+
+OVERNIGHT GAPS DETECTED:
+{json.dumps(gap_data, indent=2, default=str)}
+
+MARKET EVENTS TODAY:
+{json.dumps(events or {}, indent=2, default=str)}
+
+Analyze each gap and return JSON:
+{{
+    "approved_trades": [
+        {{
+            "symbol": "SYM",
+            "direction": "LONG|SHORT",
+            "strategy": "GAP_CONTINUATION|GAP_FILL|GAP_BREAKAWAY",
+            "entry_zone": [lower, upper],
+            "stop_loss": price,
+            "target_1": price,
+            "target_2": price,
+            "position_size_factor": 0.5-1.5,
+            "confidence": 0-100,
+            "reason": "why this gap is tradeable"
+        }}
+    ],
+    "rejected_gaps": {{
+        "SYM": "reason for rejection"
+    }},
+    "max_gap_trades": 2,
+    "overall_gap_sentiment": "bullish|bearish|mixed",
+    "notes": "overall market gap analysis"
+}}
+
+GAP TRADING RULES:
+1. BREAKAWAY GAPS (large + volume + new trend): Trade WITH gap, don't fade
+2. CONTINUATION GAPS (mid-trend): Trade WITH gap direction
+3. EXHAUSTION GAPS (extreme + end of trend): FADE the gap
+4. COMMON GAPS (small, no volume): Expect gap fill, fade cautiously
+5. NEVER trade gaps in stocks with earnings TODAY
+6. Prefer gaps that are stock-specific (sector didn't gap same way)
+7. Max 2-3 gap trades per day to manage risk
+8. Gap trades work best in first 30-60 minutes"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=800)
+        return self._validate_gap_analysis(result, gap_data) if result else self._default_gap_analysis(gap_data)
+    
+    def _validate_gap_analysis(self, result, gap_data):
+        """Validate Claude's gap analysis."""
+        v = result.copy()
+        
+        # Ensure approved_trades is a list
+        if "approved_trades" not in v:
+            v["approved_trades"] = []
+        
+        # Validate each approved trade
+        validated_trades = []
+        for trade in v.get("approved_trades", []):
+            if not trade.get("symbol"):
+                continue
+            
+            # Ensure required fields
+            trade["confidence"] = max(0, min(100, trade.get("confidence", 50)))
+            trade["position_size_factor"] = max(0.3, min(1.5, trade.get("position_size_factor", 1.0)))
+            
+            # Must have stop loss
+            if not trade.get("stop_loss"):
+                continue
+            
+            validated_trades.append(trade)
+        
+        v["approved_trades"] = validated_trades[:3]  # Max 3 gap trades
+        v["max_gap_trades"] = min(3, v.get("max_gap_trades", 2))
+        v["validated"] = True
+        
+        return v
+    
+    def _default_gap_analysis(self, gap_data):
+        """Default gap analysis when Claude is unavailable."""
+        approved = []
+        rejected = {}
+        
+        for gap in gap_data:
+            symbol = gap.get("symbol", "")
+            gap_pct = abs(gap.get("gap_pct", 0))
+            gap_type = gap.get("gap_type", "common")
+            
+            # Simple rules-based approval
+            if gap_pct < 0.5:
+                rejected[symbol] = "Gap too small (<0.5%)"
+                continue
+            
+            if gap_type == "breakaway" and gap_pct >= 1.5:
+                direction = "LONG" if gap.get("gap_pct", 0) > 0 else "SHORT"
+                approved.append({
+                    "symbol": symbol,
+                    "direction": direction,
+                    "strategy": "GAP_BREAKAWAY",
+                    "confidence": 70,
+                    "position_size_factor": 1.0,
+                    "reason": f"Strong breakaway gap {gap_pct:.1f}%"
+                })
+            elif gap_type == "common" and 0.5 <= gap_pct <= 1.5:
+                direction = "SHORT" if gap.get("gap_pct", 0) > 0 else "LONG"
+                approved.append({
+                    "symbol": symbol,
+                    "direction": direction,
+                    "strategy": "GAP_FILL",
+                    "confidence": 60,
+                    "position_size_factor": 0.8,
+                    "reason": f"Common gap {gap_pct:.1f}% likely to fill"
+                })
+            else:
+                rejected[symbol] = f"Gap type {gap_type} not ideal for trading"
+        
+        return {
+            "approved_trades": approved[:2],  # Max 2 without Claude
+            "rejected_gaps": rejected,
+            "max_gap_trades": 2,
+            "overall_gap_sentiment": "neutral",
+            "notes": "Default gap analysis (Claude unavailable)",
+            "validated": True
+        }
+    
+    def analyze_earnings_reaction(self, symbol: str, earnings_data: dict, 
+                                   price_data: dict):
+        """
+        Analyze post-earnings price action for trading opportunity.
+        Called on the day after earnings announcement.
+        
+        Args:
+            symbol: Stock symbol
+            earnings_data: Dict with beat/miss, guidance, etc.
+            price_data: Dict with gap_pct, first_hour_trend, volume_ratio
+        """
+        if not self.enabled:
+            return self._default_earnings_reaction(symbol, price_data)
+        
+        prompt = f"""POST-EARNINGS ANALYSIS — {symbol}
+
+EARNINGS DATA:
+{json.dumps(earnings_data, indent=2, default=str)}
+
+PRICE REACTION:
+{json.dumps(price_data, indent=2, default=str)}
+
+Analyze the earnings reaction and return JSON:
+{{
+    "trade_recommendation": "LONG|SHORT|AVOID",
+    "confidence": 0-100,
+    "entry_strategy": "GAP_CONTINUATION|GAP_FADE|WAIT_FOR_PULLBACK|NO_TRADE",
+    "entry_price_zone": [lower, upper],
+    "stop_loss": price,
+    "target": price,
+    "position_size_factor": 0.5-1.0,
+    "max_hold_time": "30min|1hour|end_of_day",
+    "reasoning": "explanation",
+    "key_levels": {{
+        "support": price,
+        "resistance": price,
+        "gap_fill_level": price
+    }}
+}}
+
+EARNINGS REACTION RULES:
+1. Beat + Gap Up + Strong buying: Trade LONG continuation
+2. Beat + Gap Up + Selling: Wait for pullback or avoid
+3. Miss + Gap Down + No recovery: Trade SHORT
+4. Miss + Gap Down + Recovery attempt: Fade the bounce
+5. In-line results: Usually fade the initial move
+6. First 30 min is most volatile - smaller size
+7. Volume confirms conviction - high volume = real move"""
+
+        result = _call_claude(self.api_key, self.SYSTEM_PROMPT, prompt, max_tokens=600)
+        if result:
+            result["validated"] = True
+            return result
+        return self._default_earnings_reaction(symbol, price_data)
+    
+    def _default_earnings_reaction(self, symbol: str, price_data: dict):
+        """Default earnings reaction without Claude."""
+        gap_pct = price_data.get("gap_pct", 0)
+        volume_ratio = price_data.get("volume_ratio", 1.0)
+        
+        if abs(gap_pct) < 2:
+            return {
+                "trade_recommendation": "AVOID",
+                "confidence": 30,
+                "entry_strategy": "NO_TRADE",
+                "reasoning": "Gap too small for earnings play",
+                "validated": True
+            }
+        
+        # Large gap with volume = continuation
+        if volume_ratio > 2.0:
+            direction = "LONG" if gap_pct > 0 else "SHORT"
+            strategy = "GAP_CONTINUATION"
+        else:
+            # Low volume gap = fade
+            direction = "SHORT" if gap_pct > 0 else "LONG"
+            strategy = "GAP_FADE"
+        
+        return {
+            "trade_recommendation": direction,
+            "confidence": 55,
+            "entry_strategy": strategy,
+            "position_size_factor": 0.7,  # Reduced for earnings volatility
+            "max_hold_time": "1hour",
+            "reasoning": f"Default earnings analysis: {gap_pct:+.1f}% gap, {volume_ratio:.1f}x volume",
+            "validated": True
+        }

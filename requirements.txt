@@ -1,4 +1,4 @@
-kiteconnect>=5.0.0
+# Core dependencies
 pandas>=2.0.0
 numpy>=1.24.0
 pyyaml>=6.0
@@ -15,3 +15,19 @@ smartapi-python>=1.5.0
 pyotp>=2.9.0
 websocket-client>=1.6.0
 logzero>=1.7.0
+
+# Parameter Optimization
+optuna>=3.4.0
+
+# Dashboard
+streamlit>=1.28.0
+plotly>=5.18.0
+
+# Database (optional - SQLite built-in, these for TimescaleDB)
+# psycopg2-binary>=2.9.9
+
+# Claude AI Integration
+anthropic>=0.18.0
+
+# Additional analytics
+statsmodels>=0.14.0

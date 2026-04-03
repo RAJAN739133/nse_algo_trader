@@ -1010,6 +1010,221 @@ def is_stock_in_strong_sector(symbol):
 
 
 # ════════════════════════════════════════════════════════════
+# CORRELATION TRACKING — Avoid correlated positions
+# ════════════════════════════════════════════════════════════
+
+class CorrelationTracker:
+    """
+    Track rolling correlations between stocks to avoid correlated positions.
+    Pro traders use this to ensure true diversification.
+    """
+    def __init__(self, lookback_days=30, correlation_threshold=0.7):
+        self.lookback_days = lookback_days
+        self.threshold = correlation_threshold
+        self.correlation_matrix = None
+        self.last_update = None
+        self._price_cache = {}
+    
+    def update_correlations(self, symbols, loader=None):
+        """Calculate rolling correlation matrix for given symbols."""
+        import yfinance as yf
+        
+        if loader is None:
+            loader = DataLoader()
+        
+        # Get price data for all symbols
+        prices = {}
+        for sym in symbols[:50]:  # Limit to top 50 for speed
+            try:
+                if sym in self._price_cache:
+                    prices[sym] = self._price_cache[sym]
+                else:
+                    df = yf.download(f"{sym}.NS", period=f"{self.lookback_days + 5}d", 
+                                    interval="1d", progress=False)
+                    if len(df) >= self.lookback_days // 2:
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = [c[0].lower() for c in df.columns]
+                        prices[sym] = df['close'].pct_change().dropna()
+                        self._price_cache[sym] = prices[sym]
+            except:
+                pass
+        
+        if len(prices) < 2:
+            return
+        
+        # Create DataFrame with aligned dates
+        price_df = pd.DataFrame(prices)
+        price_df = price_df.dropna(axis=1, thresh=self.lookback_days // 2)
+        
+        if price_df.shape[1] >= 2:
+            self.correlation_matrix = price_df.corr()
+            self.last_update = datetime.now()
+            logger.debug(f"Correlation matrix updated: {self.correlation_matrix.shape}")
+    
+    def get_correlation(self, sym1, sym2):
+        """Get correlation between two symbols."""
+        if self.correlation_matrix is None:
+            return 0.0
+        
+        try:
+            if sym1 in self.correlation_matrix.columns and sym2 in self.correlation_matrix.columns:
+                return self.correlation_matrix.loc[sym1, sym2]
+        except:
+            pass
+        return 0.0
+    
+    def is_correlated_with_portfolio(self, symbol, portfolio_symbols):
+        """
+        Check if symbol is highly correlated with any stock in portfolio.
+        Returns (is_correlated, max_correlation, correlated_with)
+        """
+        if not portfolio_symbols:
+            return False, 0.0, None
+        
+        max_corr = 0.0
+        correlated_with = None
+        
+        for port_sym in portfolio_symbols:
+            corr = abs(self.get_correlation(symbol, port_sym))
+            if corr > max_corr:
+                max_corr = corr
+                correlated_with = port_sym
+        
+        is_correlated = max_corr >= self.threshold
+        return is_correlated, max_corr, correlated_with
+    
+    def get_diversified_subset(self, candidates, max_stocks=10):
+        """
+        From a list of candidate stocks, select a diversified subset
+        where no two stocks have correlation > threshold.
+        """
+        if self.correlation_matrix is None or len(candidates) == 0:
+            return candidates[:max_stocks]
+        
+        selected = []
+        for stock in candidates:
+            sym = stock["symbol"] if isinstance(stock, dict) else stock
+            
+            is_corr, corr_val, corr_with = self.is_correlated_with_portfolio(
+                sym, [s["symbol"] if isinstance(s, dict) else s for s in selected]
+            )
+            
+            if not is_corr:
+                selected.append(stock)
+                if len(selected) >= max_stocks:
+                    break
+            else:
+                logger.debug(f"  Skipping {sym}: {corr_val:.2f} correlation with {corr_with}")
+        
+        return selected
+
+
+# Global correlation tracker
+CORRELATION_TRACKER = CorrelationTracker(lookback_days=30, correlation_threshold=0.70)
+
+
+# ════════════════════════════════════════════════════════════
+# VOLUME-BASED SLIPPAGE MODEL — Realistic execution
+# ════════════════════════════════════════════════════════════
+
+def calculate_dynamic_slippage(symbol, order_size_pct, avg_daily_volume, spread_pct=0.0005):
+    """
+    Calculate expected slippage based on order size relative to volume.
+    
+    Pro algo traders use this to estimate execution costs.
+    
+    Args:
+        symbol: Stock symbol
+        order_size_pct: Order size as % of ADV (Average Daily Volume)
+        avg_daily_volume: Stock's average daily volume
+        spread_pct: Typical bid-ask spread (default 0.05%)
+    
+    Returns:
+        Expected slippage as decimal (e.g., 0.001 = 0.1%)
+    """
+    # Base spread cost (always pay half the spread)
+    base_slippage = spread_pct / 2
+    
+    # Market impact based on participation rate
+    # Rule of thumb: sqrt(participation_rate) * impact_factor
+    participation_rate = order_size_pct / 100  # e.g., 1% of daily volume
+    
+    if participation_rate < 0.001:  # < 0.1% of ADV
+        impact = 0.0001  # 1 bps
+    elif participation_rate < 0.01:  # < 1% of ADV
+        impact = 0.0003 * np.sqrt(participation_rate * 100)  # ~3-10 bps
+    elif participation_rate < 0.05:  # < 5% of ADV
+        impact = 0.001 * np.sqrt(participation_rate * 20)  # ~10-30 bps
+    else:  # > 5% of ADV (should avoid)
+        impact = 0.003 * participation_rate * 10  # Very high impact
+    
+    total_slippage = base_slippage + impact
+    
+    # Cap at reasonable maximum
+    return min(total_slippage, 0.01)  # Max 1% slippage
+
+
+def get_max_order_size(symbol, avg_daily_volume, max_participation=0.02):
+    """
+    Calculate maximum order size to limit market impact.
+    
+    Pro rule: Don't exceed 1-2% of daily volume.
+    """
+    return int(avg_daily_volume * max_participation)
+
+
+# ════════════════════════════════════════════════════════════
+# EARNINGS CALENDAR — Skip stocks with upcoming results
+# ════════════════════════════════════════════════════════════
+
+def get_upcoming_earnings(symbols, days_ahead=5):
+    """
+    Check which stocks have earnings coming up.
+    Skip these to avoid event risk.
+    
+    Returns list of symbols to skip.
+    """
+    # Note: In production, integrate with a financial calendar API
+    # For now, we'll use a static check based on known patterns
+    
+    skip_stocks = []
+    today = date.today()
+    
+    # Q4 FY26 earnings season: Apr-May 2026
+    # Major companies report: TCS (Apr 10), Infy (Apr 14), HDFC Bank (Apr 20)
+    # This is a placeholder - integrate with real API for production
+    
+    # Approximate earnings dates (would come from API in production)
+    earnings_calendar = {
+        # Format: "SYMBOL": (month, day) for Q4 FY26
+        "TCS": (4, 10),
+        "INFY": (4, 14),
+        "WIPRO": (4, 18),
+        "HDFCBANK": (4, 20),
+        "ICICIBANK": (4, 22),
+        "AXISBANK": (4, 25),
+        "RELIANCE": (4, 28),
+        "BAJFINANCE": (4, 22),
+        # Add more as needed
+    }
+    
+    for sym in symbols:
+        if sym in earnings_calendar:
+            earn_month, earn_day = earnings_calendar[sym]
+            try:
+                earn_date = date(today.year, earn_month, earn_day)
+                days_to_earnings = (earn_date - today).days
+                
+                if 0 <= days_to_earnings <= days_ahead:
+                    skip_stocks.append(sym)
+                    logger.info(f"  ⚠️ Skipping {sym}: Earnings in {days_to_earnings} days")
+            except:
+                pass
+    
+    return skip_stocks
+
+
+# ════════════════════════════════════════════════════════════
 # DYNAMIC STOCK SELECTION — no hardcoded list
 # ════════════════════════════════════════════════════════════
 
@@ -1043,12 +1258,27 @@ def select_best_stocks(universe_symbols, config, target_date=None, top_n=8):
 
     all_feat = pd.concat(featured, ignore_index=True)
 
-    # Step 2: ML scoring — try V2 model first, fallback to V1
+    # Step 2: ML scoring — try models in order of preference
     model, feats = None, None
+    ml_pipeline = None
     
-    # Try V2 model first (better for bear markets)
+    # Model paths in order of preference
+    mp_new = Path("models/trading_model.pkl")  # New ML pipeline model
     mp_v2 = Path("models/stock_predictor_v2.pkl")
     mp_v1 = Path("models/stock_predictor.pkl")
+    
+    # Try new ML pipeline first (if available)
+    if mp_new.exists():
+        try:
+            from ml.data_pipeline import MLDataPipeline
+            ml_pipeline = MLDataPipeline()
+            if ml_pipeline.load_model("trading_model"):
+                logger.info(f"  Using NEW ML pipeline model (52 features)")
+            else:
+                ml_pipeline = None
+        except Exception as e:
+            logger.debug(f"  New ML pipeline not available: {e}")
+            ml_pipeline = None
     
     if mp_v2.exists():
         try:
@@ -1318,6 +1548,20 @@ class AdaptiveV3Trader:
         self.capital = config["capital"]["total"]
         self.config = config
         self.cost_model = AngelOneCostModel()
+        
+        # Claude Brain dynamic parameters (can be adjusted during trading)
+        self.position_size_factor = config.get("position_size_factor", 1.0)
+        self.risk_per_trade = config["capital"].get("risk_per_trade", 0.02)
+        
+        # Strategy tweaks from Claude Brain (with defaults)
+        tweaks = config.get("strategy_tweaks", {})
+        self.target_pct = tweaks.get("target_pct", 0.01)
+        self.stop_pct = tweaks.get("stop_pct", 0.005)
+        self.quick_profit_pct = tweaks.get("quick_profit_pct", 0.008)
+        self.cut_loss_pct = tweaks.get("cut_loss_pct", 0.004)
+        self.trailing_activation_pct = tweaks.get("trailing_activation_pct", 0.005)
+        self.time_decay_candles = tweaks.get("time_decay_candles", 24)
+        self.orb_atr_multiplier = tweaks.get("orb_atr_multiplier", 1.5)
         self.strategy = ProStrategyV2(config.get("strategies", {}).get("pro", {}))
         self.regime_detector = RegimeDetector()
         self.pattern_detector = CandlePatternDetector()  # Candlestick patterns
@@ -1348,6 +1592,10 @@ class AdaptiveV3Trader:
         self.partial_exited = False
         self.trade_type = ""
         self.current_regime = "unknown"
+        
+        # Gap trading state
+        self.prev_close = None  # Set from daily data before trading starts
+        self.gap_pct = 0.0      # Today's gap percentage
         self.entry_regime = "unknown"  # regime at time of entry
         self.pattern_score = 0  # Track pattern confirmation
         
@@ -1378,8 +1626,16 @@ class AdaptiveV3Trader:
             gross = (exit_price - self.entry_price) * shares
         costs = self.cost_model.calculate(self.entry_price * shares, exit_price * shares).total
         net = gross - costs
+        
+        # Calculate holding time
+        try:
+            entry_dt = pd.to_datetime(self.entry_time)
+            exit_dt = pd.to_datetime(exit_time)
+            holding_minutes = int((exit_dt - entry_dt).total_seconds() / 60)
+        except:
+            holding_minutes = 0
 
-        self.trades.append({
+        trade_record = {
             "symbol": self.symbol, "direction": self.side,
             "type": self.trade_type, "regime": self.entry_regime,
             "entry": round(self.entry_price, 2), "exit": round(exit_price, 2),
@@ -1389,7 +1645,32 @@ class AdaptiveV3Trader:
             "qty": shares, "gross": round(gross, 2),
             "costs": round(costs, 2), "net_pnl": round(net, 2),
             "reason": reason,
-        })
+            "holding_minutes": holding_minutes,
+        }
+        self.trades.append(trade_record)
+        
+        # Log to paper trading tracker (only in paper mode)
+        if self.config.get("trading", {}).get("mode") == "paper":
+            try:
+                from paper_trading_tracker import PaperTradingTracker
+                tracker = PaperTradingTracker()
+                tracker.log_trade({
+                    "symbol": self.symbol,
+                    "side": self.side,
+                    "strategy": self.trade_type,
+                    "entry_price": self.entry_price,
+                    "exit_price": exit_price,
+                    "shares": shares,
+                    "gross_pnl": gross,
+                    "costs": costs,
+                    "net_pnl": net,
+                    "holding_minutes": holding_minutes,
+                    "exit_reason": reason,
+                    "regime": self.entry_regime,
+                    "vix": getattr(self, 'vix_at_entry', None),
+                })
+            except Exception as e:
+                logger.debug(f"Paper tracker log failed: {e}")
 
         self.day_pnl += net
 
@@ -1399,14 +1680,7 @@ class AdaptiveV3Trader:
         action_entry = "BOUGHT" if self.side == "LONG" else "SOLD SHORT"
         action_exit = "SOLD" if self.side == "LONG" else "COVERED"
         
-        # Calculate holding time
-        try:
-            entry_dt = pd.to_datetime(self.entry_time)
-            exit_dt = pd.to_datetime(exit_time)
-            hold_mins = int((exit_dt - entry_dt).total_seconds() / 60)
-            hold_str = f"{hold_mins} min"
-        except:
-            hold_str = "N/A"
+        hold_str = f"{holding_minutes} min" if holding_minutes > 0 else "N/A"
         
         # Calculate return percentage
         return_pct = (net / (self.entry_price * shares)) * 100 if self.entry_price > 0 else 0
@@ -1540,31 +1814,36 @@ class AdaptiveV3Trader:
             else:
                 self.tgt = self.entry_price - risk * max(original_rr, 1.5)
 
-        # ── FIX 3: Regime-based position sizing ──
-        risk_pct = self.strategy.max_risk_pct
+        # ══════════════════════════════════════════════════════════════
+        # DYNAMIC POSITION SIZING (Claude Brain + ML + Regime)
+        # ══════════════════════════════════════════════════════════════
+        
+        # Start with Claude Brain's dynamic risk (or config default)
+        risk_pct = self.risk_per_trade  # Set by Claude Brain based on VIX/market
+        
+        # Apply Claude Brain's position size factor (market-adaptive)
+        risk_pct *= self.position_size_factor
+        
+        # Regime-based adjustment
         if self.current_regime == "volatile":
             risk_pct *= 0.5
         elif self.current_regime == "choppy":
-            risk_pct *= 0.5  # was 0.6, more conservative now
+            risk_pct *= 0.5
         elif self.current_regime == "ranging":
-            risk_pct *= 0.4  # heavily reduce in ranging
-        # Afternoon trades get 60% position (riskier time)
+            risk_pct *= 0.4
+        
+        # Afternoon trades are riskier
         if "AFTERNOON" in self.trade_type:
             risk_pct *= 0.6
         
-        # ══════════════════════════════════════════════════════════════
-        # ML-BASED POSITION SIZING ADJUSTMENT
-        # Use ML features to adjust position size
-        # ══════════════════════════════════════════════════════════════
-        
-        # High ML confidence = larger position
-        if self.ml_confidence >= 0.20:  # 20%+ confidence
-            risk_pct *= 1.2  # 20% larger position
+        # ML-based position sizing adjustment
+        if self.ml_confidence >= 0.20:
+            risk_pct *= 1.2
             signal["reason"] = f"{signal.get('reason', '')} | ML conf +20%"
         elif self.ml_confidence >= 0.15:
-            risk_pct *= 1.1  # 10% larger
+            risk_pct *= 1.1
         elif self.ml_confidence < 0.10:
-            risk_pct *= 0.8  # 20% smaller for low confidence
+            risk_pct *= 0.8
         
         # Strong trend (ADX > 30) = larger position in trend direction
         if self.adx > 30 and self.trend_strength == "strong":
@@ -1572,17 +1851,21 @@ class AdaptiveV3Trader:
             signal["reason"] = f"{signal.get('reason', '')} | ADX {self.adx:.0f}"
         
         # High volatility ratio = smaller position (risk management)
-        if self.volatility_ratio > 1.5:  # 50% more volatile than baseline
+        if self.volatility_ratio > 1.5:
             risk_pct *= 0.7
-        elif self.volatility_ratio < 0.7:  # 30% less volatile
-            risk_pct *= 1.1  # Can take slightly larger position
+        elif self.volatility_ratio < 0.7:
+            risk_pct *= 1.1
+        
+        # Cap risk_pct to safety limit (max 3%)
+        risk_pct = min(risk_pct, 0.03)
 
-        # ── FIX 1b: Cap max shares to limit single-trade damage ──
-        # INTRADAY MARGIN: Get actual margin from Angel One API (or fallback to 20%)
+        # Calculate shares based on risk
         self.shares = max(1, int(self.capital * risk_pct / max(risk, min_risk)))
         
         # Use broker's margin calculator if available
-        available_margin = self.capital * 0.40  # Use 40% of capital per trade
+        # Margin usage is also adjusted by Claude Brain's position_size_factor
+        base_margin_pct = 0.40  # Base: 40% of capital per trade
+        available_margin = self.capital * base_margin_pct * self.position_size_factor
         if hasattr(self, 'broker') and self.broker and hasattr(self.broker, 'get_margin_required'):
             # Get real margin from Angel One
             margin_for_one = self.broker.get_margin_required(
@@ -1754,35 +2037,44 @@ class AdaptiveV3Trader:
         holding_candles = i - self.entry_idx
         pct_from_entry = (c - self.entry_price) / self.entry_price if self.side == "LONG" else (self.entry_price - c) / self.entry_price
         
-        # Phase 1 (0-15 min / 3 candles): Quick scalp check
-        if holding_candles >= 3:
-            # If we have 0.5%+ profit in first 15 min, consider taking it
-            if pct_from_entry >= 0.005:  # 0.5% profit
+        # ══════════════════════════════════════════════════════════
+        # BALANCED TIME MANAGEMENT - Claude Brain guided
+        # Conservative approach: secure profits, cut losses early
+        # ══════════════════════════════════════════════════════════
+        # EXIT THRESHOLDS (Dynamic from Claude Brain)
+        # quick_profit_pct: Take profit threshold (default 0.8%)
+        # cut_loss_pct: Cut loser threshold (default 0.4%)
+        # time_decay_candles: Max holding period (default 24 = 2 hours)
+        # ══════════════════════════════════════════════════════════
+        
+        # Phase 1 (0-20 min / 4 candles): Quick profit check
+        if holding_candles >= 4:
+            if pct_from_entry >= self.quick_profit_pct:
                 self._close_trade(c, t, "QUICK_PROFIT")
-                self.cooldown_until = i + 6  # 30 min cooldown
-                return
-        
-        # Phase 2 (15-25 min / 3-5 candles): Cut losers
-        if 3 <= holding_candles < 5:
-            if pct_from_entry < -0.003:  # Losing 0.3%+
-                self._close_trade(c, t, "CUT_LOSER")
-                self.cooldown_until = i + 8  # 40 min cooldown after loss
-                return
-        
-        # Phase 3 (25-40 min / 5-8 candles): Stricter exit
-        if 5 <= holding_candles < 8:
-            if pct_from_entry < 0.002:  # Less than 0.2% profit
-                self._close_trade(c, t, "TIME_DECAY")
-                self.cooldown_until = i + 6  # 30 min cooldown
-                return
-        
-        # Phase 4 (40+ min / 8+ candles): Force exit unless big winner
-        if holding_candles >= 8:
-            if pct_from_entry < 0.008:  # Less than 0.8% profit
-                reason = "PROFIT_LOCK" if pct_from_entry > 0 else "TIME_DECAY"
-                self._close_trade(c, t, reason)
                 self.cooldown_until = i + 6
                 return
+        
+        # Phase 2 (20-35 min / 4-7 candles): Cut losers early
+        if 4 <= holding_candles < 7:
+            if pct_from_entry < -self.cut_loss_pct:
+                self._close_trade(c, t, "CUT_LOSER")
+                self.cooldown_until = i + 8
+                return
+        
+        # Phase 3 (35-50 min / 7-10 candles): Tighter management
+        time_decay_phase = int(self.time_decay_candles * 0.4)  # 40% of max hold
+        if time_decay_phase <= holding_candles < int(self.time_decay_candles * 0.5):
+            if pct_from_entry < self.quick_profit_pct * 0.25:  # Less than 25% of target
+                self._close_trade(c, t, "TIME_DECAY")
+                self.cooldown_until = i + 6
+                return
+        
+        # Phase 4: Force exit at max holding time
+        if holding_candles >= self.time_decay_candles:
+            reason = "PROFIT_LOCK" if pct_from_entry > 0 else "TIME_DECAY"
+            self._close_trade(c, t, reason)
+            self.cooldown_until = i + 6
+            return
 
         if self.side == "LONG":
             # BACKTEST INSIGHT: Stop losses were 100% losers
@@ -1807,18 +2099,21 @@ class AdaptiveV3Trader:
             
             # ══════════════════════════════════════════════════════════
             # TRAILING STOP: Lock in profits as price moves up
+            # Uses dynamic trailing_activation_pct from Claude Brain
             # ══════════════════════════════════════════════════════════
             unrealised_pct = (c - self.entry_price) / self.entry_price
             
-            # Stage 1: Move to breakeven after 0.5% profit
-            if unrealised_pct >= 0.005 and not self.sl_moved_to_be:
+            # Stage 1: Move to breakeven after activation threshold
+            if unrealised_pct >= self.trailing_activation_pct and not self.sl_moved_to_be:
                 self.sl = self.entry_price + 0.10  # Just above entry
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
             
-            # Stage 2: Trail stop 0.2% behind price after 0.7% profit (tighter)
-            if unrealised_pct >= 0.007:
-                new_sl = c * 0.998  # 0.2% below current price (tighter than 0.3%)
+            # Stage 2: Trail stop behind price after 1.4x activation (dynamic)
+            trail_threshold = self.trailing_activation_pct * 1.4
+            if unrealised_pct >= trail_threshold:
+                trail_distance = self.trailing_activation_pct * 0.4  # Trail 40% of activation
+                new_sl = c * (1 - trail_distance)
                 if new_sl > self.sl:
                     self.sl = new_sl
                     logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
@@ -1844,18 +2139,21 @@ class AdaptiveV3Trader:
             
             # ══════════════════════════════════════════════════════════
             # TRAILING STOP: Lock in profits as price moves down (SHORT)
+            # Uses dynamic trailing_activation_pct from Claude Brain
             # ══════════════════════════════════════════════════════════
             unrealised_pct = (self.entry_price - c) / self.entry_price
             
-            # Stage 1: Move to breakeven after 0.5% profit
-            if unrealised_pct >= 0.005 and not self.sl_moved_to_be:
+            # Stage 1: Move to breakeven after activation threshold
+            if unrealised_pct >= self.trailing_activation_pct and not self.sl_moved_to_be:
                 self.sl = self.entry_price - 0.10  # Just below entry
                 self.sl_moved_to_be = True
                 logger.info(f"  {self.symbol} SL -> breakeven Rs {self.sl:,.2f}")
             
-            # Stage 2: Trail stop 0.2% above price after 0.7% profit (tighter)
-            if unrealised_pct >= 0.007:
-                new_sl = c * 1.002  # 0.2% above current price (tighter than 0.3%)
+            # Stage 2: Trail stop above price after 1.4x activation (dynamic)
+            trail_threshold = self.trailing_activation_pct * 1.4
+            if unrealised_pct >= trail_threshold:
+                trail_distance = self.trailing_activation_pct * 0.4  # Trail 40% of activation
+                new_sl = c * (1 + trail_distance)
                 if new_sl < self.sl:
                     self.sl = new_sl
                     logger.info(f"  {self.symbol} Trailing SL -> Rs {self.sl:,.2f}")
@@ -1947,6 +2245,21 @@ class AdaptiveV3Trader:
         # STRATEGY 1: ORB BREAKOUT/BREAKDOWN (9:20-10:30)
         # - In BULLISH market + trending_up: ORB BREAKOUT (LONG)
         # - In BEARISH market + trending_down: ORB BREAKDOWN (SHORT)
+        # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 0: GAP TRADING (9:15-10:00)
+        # First hour gap plays - continuation or fill
+        # Uses Claude Brain for gap analysis
+        # ══════════════════════════════════════════════════════════════
+        if hour == 9 and minute >= 15 and minute <= 45:
+            if "GAP" not in avoid_strategies:
+                gap_signal = self._generate_gap_signal(candles, i, direction)
+                if gap_signal:
+                    self._enter_trade(gap_signal, i)
+                    return
+        
+        # ══════════════════════════════════════════════════════════════
+        # STRATEGY 1: ORB BREAKOUT (9:45-10:30)
         # ══════════════════════════════════════════════════════════════
         if hour < 10 or (hour == 10 and minute <= 30):
             if "ORB" not in avoid_strategies:
@@ -2090,29 +2403,28 @@ class AdaptiveV3Trader:
             return None
 
         # ══════════════════════════════════════════════════════════
-        # VIX-ADJUSTED TARGETS (April 2 insight: VIX 25.52 = 2% targets)
+        # DYNAMIC TARGETS (Claude Brain or VIX fallback)
+        # target_pct and stop_pct come from Claude Brain via config
         # ══════════════════════════════════════════════════════════
-        vix_params = get_vix_adjusted_params()
-        target_pct = vix_params["target_pct"]
+        target_pct = self.target_pct  # From Claude Brain
+        atr_mult = self.orb_atr_multiplier  # From Claude Brain
         
         # MUST align with real-time market direction
         if direction == "LONG" and price_change > 0.005:
             atr = self._quick_atr(candles, i)
-            sl = close - atr * 1.5
+            sl = close - atr * atr_mult
             risk = close - sl
-            # VIX-adjusted target
             tgt = close * (1 + target_pct)
             return {
                 "side": "LONG", "entry": close, "sl": sl, "tgt": tgt,
                 "risk": risk, "time": t, "type": "MOMENTUM_LONG",
                 "reason": f"Momentum +{price_change*100:.1f}% with vol, VIX={VIX_LEVEL:.0f}",
-                "candles": candles  # Pass candles for pattern check
+                "candles": candles
             }
         elif direction == "SHORT" and price_change < -0.005:
             atr = self._quick_atr(candles, i)
-            sl = close + atr * 1.5
+            sl = close + atr * atr_mult
             risk = sl - close
-            # VIX-adjusted target (tighter in choppy)
             adj_target = target_pct * 0.8 if self.current_regime == "choppy" else target_pct
             tgt = close * (1 - adj_target)
             return {
@@ -2191,9 +2503,12 @@ class AdaptiveV3Trader:
         trend_up = all(recent_close.diff().dropna() > 0)
         trend_down = all(recent_close.diff().dropna() < 0)
 
+        # Use dynamic ATR multiplier from Claude Brain (slightly tighter for afternoon)
+        afternoon_atr_mult = self.orb_atr_multiplier * 0.8  # 80% of normal for tighter stops
+        
         if direction == "LONG" and trend_up and rsi > 55 and close > vwap:
             atr = self._quick_atr(candles, i)
-            sl = close - atr * 1.2
+            sl = close - atr * afternoon_atr_mult
             risk = close - sl
             tgt = close + risk * 1.5
             return {
@@ -2204,7 +2519,7 @@ class AdaptiveV3Trader:
 
         if direction == "SHORT" and trend_down and rsi < 45 and close < vwap:
             atr = self._quick_atr(candles, i)
-            sl = close + atr * 1.2
+            sl = close + atr * afternoon_atr_mult
             risk = sl - close
             tgt = close - risk * 1.5
             return {
@@ -2265,6 +2580,151 @@ class AdaptiveV3Trader:
             resistance = min(vwap, today_open) if today_open > current else vwap
         
         return support, resistance
+    
+    def _generate_gap_signal(self, candles, i, direction):
+        """
+        Generate gap trading signal in the first 30 minutes.
+        
+        Gap Types:
+        1. GAP_CONTINUATION: Trade with the gap direction (breakaway/continuation gaps)
+        2. GAP_FILL: Fade the gap (common/exhaustion gaps)
+        
+        Uses Claude Brain for analysis when available.
+        """
+        if i < 3:
+            return None
+        
+        row = candles.iloc[i]
+        close = row["close"]
+        t = pd.to_datetime(row["datetime"])
+        today_open = candles["open"].iloc[0]
+        
+        # Calculate gap from previous close (stored at init)
+        if not hasattr(self, 'prev_close') or self.prev_close is None:
+            # Estimate prev_close from first candle if not stored
+            first_open = candles["open"].iloc[0]
+            # If gap > 0.3%, consider it a real gap
+            self.prev_close = first_open  # Will be set properly in run()
+            return None
+        
+        gap_pct = (today_open - self.prev_close) / self.prev_close
+        abs_gap = abs(gap_pct)
+        
+        # Skip micro gaps
+        if abs_gap < 0.005:  # < 0.5%
+            return None
+        
+        # Determine gap direction
+        gap_up = gap_pct > 0
+        
+        # Current price position relative to gap
+        filled_pct = 0
+        if gap_up:
+            # For gap up: filled_pct = how much has price dropped from open
+            filled_pct = (today_open - close) / (today_open - self.prev_close) if today_open != self.prev_close else 0
+        else:
+            # For gap down: filled_pct = how much has price risen from open
+            filled_pct = (close - today_open) / (self.prev_close - today_open) if today_open != self.prev_close else 0
+        
+        # Volume analysis
+        avg_vol = candles["volume"].iloc[:i].mean() if i > 0 else candles["volume"].iloc[0]
+        curr_vol = candles["volume"].iloc[i]
+        vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 1.0
+        
+        # First 15 min trend
+        first_candles = candles.iloc[:min(i+1, 3)]
+        first_trend = "UP" if first_candles["close"].iloc[-1] > first_candles["open"].iloc[0] else "DOWN"
+        
+        signal = None
+        
+        # ══════════════════════════════════════════════════════════
+        # GAP CONTINUATION (Trade WITH the gap)
+        # - Large gap (>1%) + Volume + Price holding near open
+        # ══════════════════════════════════════════════════════════
+        if abs_gap >= 0.01 and vol_ratio >= 1.5 and filled_pct < 0.3:
+            if gap_up and direction == "LONG" and first_trend == "UP":
+                # Gap up continuation - go LONG
+                atr = self._quick_atr(candles, i)
+                sl = min(self.prev_close, today_open - atr * self.orb_atr_multiplier)
+                target_pct = self.target_pct * 1.5  # Wider target for gap plays
+                tgt = close * (1 + target_pct)
+                
+                signal = {
+                    "side": "LONG",
+                    "entry": close,
+                    "sl": sl,
+                    "tgt": tgt,
+                    "risk": close - sl,
+                    "time": t,
+                    "type": "GAP_CONTINUATION_LONG",
+                    "reason": f"Gap +{gap_pct*100:.1f}% holding, vol {vol_ratio:.1f}x"
+                }
+            
+            elif not gap_up and direction == "SHORT" and first_trend == "DOWN":
+                # Gap down continuation - go SHORT
+                atr = self._quick_atr(candles, i)
+                sl = max(self.prev_close, today_open + atr * self.orb_atr_multiplier)
+                target_pct = self.target_pct * 1.5
+                tgt = close * (1 - target_pct)
+                
+                signal = {
+                    "side": "SHORT",
+                    "entry": close,
+                    "sl": sl,
+                    "tgt": tgt,
+                    "risk": sl - close,
+                    "time": t,
+                    "type": "GAP_CONTINUATION_SHORT",
+                    "reason": f"Gap {gap_pct*100:.1f}% holding, vol {vol_ratio:.1f}x"
+                }
+        
+        # ══════════════════════════════════════════════════════════
+        # GAP FILL (Fade the gap)
+        # - Smaller gap (0.5-1.5%) + Weak volume + Already filling
+        # ══════════════════════════════════════════════════════════
+        elif 0.005 <= abs_gap <= 0.015 and vol_ratio < 1.3 and 0.2 <= filled_pct <= 0.6:
+            if gap_up and direction == "SHORT":
+                # Fading gap up - go SHORT for gap fill
+                atr = self._quick_atr(candles, i)
+                sl = today_open + atr * 0.5  # Tight stop above today's open
+                tgt = self.prev_close  # Target = gap fill
+                
+                # Only if gap fill target gives good R:R
+                risk = sl - close
+                reward = close - tgt
+                if reward > risk * 1.5:
+                    signal = {
+                        "side": "SHORT",
+                        "entry": close,
+                        "sl": sl,
+                        "tgt": tgt,
+                        "risk": risk,
+                        "time": t,
+                        "type": "GAP_FILL_SHORT",
+                        "reason": f"Fading +{gap_pct*100:.1f}% gap, {filled_pct*100:.0f}% filled"
+                    }
+            
+            elif not gap_up and direction == "LONG":
+                # Fading gap down - go LONG for gap fill
+                atr = self._quick_atr(candles, i)
+                sl = today_open - atr * 0.5  # Tight stop below today's open
+                tgt = self.prev_close  # Target = gap fill
+                
+                risk = close - sl
+                reward = tgt - close
+                if reward > risk * 1.5:
+                    signal = {
+                        "side": "LONG",
+                        "entry": close,
+                        "sl": sl,
+                        "tgt": tgt,
+                        "risk": risk,
+                        "time": t,
+                        "type": "GAP_FILL_LONG",
+                        "reason": f"Fading {gap_pct*100:.1f}% gap, {filled_pct*100:.0f}% filled"
+                    }
+        
+        return signal
 
 
 # ════════════════════════════════════════════════════════════
@@ -2272,6 +2732,8 @@ class AdaptiveV3Trader:
 # ════════════════════════════════════════════════════════════
 
 def run(symbols=None, backtest_date=None):
+    global MARKET_TREND, ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS
+    
     config = load_config()
     target_date = date.fromisoformat(backtest_date) if backtest_date else None
     is_backtest = target_date is not None
@@ -2405,8 +2867,81 @@ def run(symbols=None, backtest_date=None):
                 f"{intraday_str}",
                 config,
             )
+            # Apply Claude Brain's dynamic parameters
             if brain_advice.get("max_trades"):
                 config["capital"]["max_trades_per_day"] = brain_advice["max_trades"]
+                logger.info(f"  🧠 Claude set max_trades = {brain_advice['max_trades']}")
+            
+            if brain_advice.get("risk_per_trade_pct"):
+                config["capital"]["risk_per_trade"] = brain_advice["risk_per_trade_pct"]
+                logger.info(f"  🧠 Claude set risk_per_trade = {brain_advice['risk_per_trade_pct']*100:.1f}%")
+            
+            if brain_advice.get("position_size_factor"):
+                config["position_size_factor"] = brain_advice["position_size_factor"]
+                logger.info(f"  🧠 Claude set position_size_factor = {brain_advice['position_size_factor']:.1f}x")
+            
+            # Apply strategy tweaks
+            tweaks = brain_advice.get("strategy_tweaks", {})
+            if tweaks:
+                config["strategy_tweaks"] = tweaks
+                logger.info(f"  🧠 Claude set target={tweaks.get('target_pct',0)*100:.1f}%, "
+                           f"stop={tweaks.get('stop_pct',0)*100:.1f}%, "
+                           f"quick_profit={tweaks.get('quick_profit_pct',0)*100:.1f}%")
+            
+            # Apply entry filters (direction control)
+            filters = brain_advice.get("entry_filters", {})
+            if filters:
+                global ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS, MIN_ML_CONFIDENCE, BLOCKED_REGIMES
+                if "enable_longs" in filters:
+                    ENABLE_LONGS = filters["enable_longs"]
+                if "enable_shorts" in filters:
+                    ENABLE_SHORTS = filters["enable_shorts"]
+                if "max_longs" in filters:
+                    MAX_LONGS = filters["max_longs"]
+                if "max_shorts" in filters:
+                    MAX_SHORTS = filters["max_shorts"]
+                if "min_ml_confidence" in filters:
+                    MIN_ML_CONFIDENCE = filters["min_ml_confidence"]
+                if "blocked_regimes" in filters:
+                    BLOCKED_REGIMES = filters["blocked_regimes"]
+                logger.info(f"  🧠 Claude set LONGS={ENABLE_LONGS}(max {MAX_LONGS}), "
+                           f"SHORTS={ENABLE_SHORTS}(max {MAX_SHORTS}), "
+                           f"ML_conf={MIN_ML_CONFIDENCE*100:.0f}%")
+
+    # ══════════════════════════════════════════════════════════════
+    # GAP TRADING & EVENT ANALYSIS (9:10 AM - After Opening Prices)
+    # ══════════════════════════════════════════════════════════════
+    gap_signals = []
+    event_warnings = {"avoid": [], "caution": [], "opportunities": []}
+    
+    if not is_backtest:
+        try:
+            from core.event_calendar import get_event_warnings, get_morning_gap_signals, GapAnalyzer
+            
+            # Get event warnings (earnings, RBI, etc.)
+            if symbols:
+                event_warnings = get_event_warnings(symbols)
+            else:
+                # Get warnings for popular stocks
+                popular = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
+                          "HINDUNILVR", "SBIN", "BHARTIARTL", "KOTAKBANK", "ITC"]
+                event_warnings = get_event_warnings(popular)
+            
+            if event_warnings.get("avoid"):
+                logger.info(f"  ⚠️ AVOID (earnings today): {event_warnings['avoid']}")
+            if event_warnings.get("caution"):
+                logger.info(f"  ⚡ CAUTION (RBI impact): {event_warnings['caution'][:5]}")
+            if event_warnings.get("opportunities"):
+                logger.info(f"  💰 POST-EARNINGS opportunities: {event_warnings['opportunities']}")
+            
+            # Analyze overnight gaps after market opens (9:15+)
+            # This would be called with real opening data in live trading
+            logger.info("  📊 Gap analysis will run after 9:15 AM with opening prices")
+            
+        except ImportError as e:
+            logger.debug(f"Event calendar not available: {e}")
+        except Exception as e:
+            logger.warning(f"Gap/event analysis failed: {e}")
 
     # ── Dynamic stock selection (EXPANDED for intraday) ──
     if symbols:
