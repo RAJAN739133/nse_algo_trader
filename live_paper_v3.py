@@ -163,9 +163,9 @@ def load_config():
         if Path(p).exists():
             with open(p) as f:
                 return yaml.safe_load(f)
-    return {"capital": {"total": 100000, "risk_per_trade": 0.01, "max_trades_per_day": 5,
+    return {"capital": {"total": 10000, "risk_per_trade": 0.01, "max_trades_per_day": 5,
                         "daily_loss_limit": 0.03},
-            "alerts": {"telegram_enabled": False}}
+            "alerts": {"telegram_enabled": True}}
 
 
 # ════════════════════════════════════════════════════════════
