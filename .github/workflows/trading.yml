@@ -119,11 +119,15 @@ jobs:
           from pathlib import Path
           
           token = os.environ.get('TG_TOKEN', '')
-          chat_id = os.environ.get('TG_CHAT', '')
+          chat_ids_str = os.environ.get('TG_CHAT', '')
           
-          if not token or not chat_id:
+          if not token or not chat_ids_str:
             print("Telegram not configured")
             exit(0)
+          
+          # Support multiple chat IDs (comma-separated)
+          chat_ids = [cid.strip() for cid in chat_ids_str.split(',') if cid.strip()]
+          print(f"Sending to {len(chat_ids)} recipient(s)")
           
           today = date.today()
           holidays = {'2026-04-03'}  # Add more as needed
@@ -143,17 +147,19 @@ jobs:
             else:
               msg = f"📊 {today}\n📭 No trades today"
           
-          try:
-            data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
-            req = urllib.request.Request(
-              f'https://api.telegram.org/bot{token}/sendMessage',
-              data=data,
-              headers={'Content-Type': 'application/json'}
-            )
-            urllib.request.urlopen(req, timeout=10)
-            print("Notification sent")
-          except Exception as e:
-            print(f"Notification failed: {e}")
+          # Send to all chat IDs
+          for chat_id in chat_ids:
+            try:
+              data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+              req = urllib.request.Request(
+                f'https://api.telegram.org/bot{token}/sendMessage',
+                data=data,
+                headers={'Content-Type': 'application/json'}
+              )
+              urllib.request.urlopen(req, timeout=10)
+              print(f"✅ Sent to {chat_id}")
+            except Exception as e:
+              print(f"❌ Failed for {chat_id}: {e}")
           EOF
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
