@@ -81,8 +81,8 @@ jobs:
           broker:
             angel_one:
               api_key: "${{ secrets.ANGEL_API_KEY }}"
-              client_id: "${{ secrets.ANGEL_CLIENT_ID }}"
-              password: "${{ secrets.ANGEL_PASSWORD }}"
+              client_id: "${{ secrets.ANGEL_CLIENT_CODE }}"
+              password: "${{ secrets.ANGEL_PIN }}"
               totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
             mode: "${TRADING_MODE}"  # ALWAYS paper for safety
             data_source: "angel_one"
