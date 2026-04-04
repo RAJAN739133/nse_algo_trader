@@ -28,13 +28,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Trading mode'
+        description: 'Trading mode (PAPER ONLY for safety)'
         required: true
         default: 'paper'
         type: choice
         options:
           - paper
-          - live
+          # - live  # DISABLED for safety - uncomment only when ready for real money
       backtest_date:
         description: 'Backtest date (YYYY-MM-DD) or leave empty for live'
         required: false
@@ -68,6 +68,15 @@ jobs:
       - name: Create config from secrets
         run: |
           mkdir -p config
+          
+          # SAFETY: Force paper mode - live trading disabled
+          TRADING_MODE="paper"
+          if [ "${{ github.event.inputs.mode }}" == "live" ]; then
+            echo "⚠️ WARNING: Live mode requested but DISABLED for safety"
+            echo "⚠️ Running in PAPER mode instead"
+            TRADING_MODE="paper"
+          fi
+          
           cat > config/config_prod.yaml << EOF
           broker:
             angel_one:
@@ -75,7 +84,7 @@ jobs:
               client_id: "${{ secrets.ANGEL_CLIENT_ID }}"
               password: "${{ secrets.ANGEL_PASSWORD }}"
               totp_secret: "${{ secrets.ANGEL_TOTP_SECRET }}"
-            mode: "${{ github.event.inputs.mode || 'paper' }}"
+            mode: "${TRADING_MODE}"  # ALWAYS paper for safety
             data_source: "angel_one"
           
           capital:
