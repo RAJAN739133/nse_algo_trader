@@ -141,9 +141,129 @@ DAILY_STARTING_CAPITAL = 0.0       # Capital at start of day
 # With tiny capital, we need larger position % per trade
 # BUT limit total concurrent positions to control risk
 # ══════════════════════════════════════════════════════════════════════
-MAX_POSITION_PCT = 0.15            # Max 15% of capital per trade 
-MIN_POSITION_PCT = 0.05            # Min 5% per trade (avoid tiny positions)
+MAX_POSITION_PCT = 0.30            # Max 30% of MARGIN per trade (not capital)
+MIN_POSITION_PCT = 0.10            # Min 10% per trade (avoid tiny positions)
 MAX_CONCURRENT_POSITIONS = 2       # ONLY 2 positions at a time (risk control!)
+
+# ══════════════════════════════════════════════════════════════════════
+# INTRADAY MARGIN LEVERAGE
+# Brokers provide 5x margin for MIS/intraday orders
+# This is KEY for small capital profitability!
+# ══════════════════════════════════════════════════════════════════════
+INTRADAY_MARGIN_MULTIPLIER = 5.0   # 5x leverage for MIS orders
+# Example: Rs 10,000 capital → Rs 50,000 buying power
+# This means with Rs 10K, you can buy stocks worth Rs 50K
+
+# ══════════════════════════════════════════════════════════════════════
+# DYNAMIC CAPITAL MANAGER - Position size grows with profits!
+# ══════════════════════════════════════════════════════════════════════
+class DynamicCapitalManager:
+    """
+    Tracks actual capital including profits/losses.
+    Position sizes automatically scale as capital grows.
+    
+    Key insight: With fixed 10K allocation, profits stay small.
+    With dynamic sizing, a 50K capital uses 7.5K per trade (15%),
+    but when it grows to 80K, trades become 12K automatically.
+    """
+    
+    def __init__(self, initial_capital: float):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.realized_pnl = 0.0
+        self.peak_capital = initial_capital
+        self.drawdown = 0.0
+        
+    def update_pnl(self, pnl: float):
+        """Update capital after a trade closes."""
+        self.realized_pnl += pnl
+        self.current_capital = self.initial_capital + self.realized_pnl
+        
+        # Track peak for drawdown calculation
+        if self.current_capital > self.peak_capital:
+            self.peak_capital = self.current_capital
+        
+        # Calculate drawdown from peak
+        if self.peak_capital > 0:
+            self.drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
+        
+        logger.info(f"💰 Capital updated: ₹{self.current_capital:,.0f} "
+                   f"(P&L: ₹{self.realized_pnl:+,.0f}, DD: {self.drawdown*100:.1f}%)")
+    
+    def get_position_size(self, risk_pct: float = 0.20) -> float:
+        """
+        Get position size based on CURRENT capital WITH MARGIN.
+        
+        Args:
+            risk_pct: Percentage of MARGIN to use per trade (default 20%)
+            
+        Returns:
+            Amount in rupees for this trade (includes margin leverage)
+        """
+        # Apply intraday margin (5x leverage)
+        margin_buying_power = self.current_capital * INTRADAY_MARGIN_MULTIPLIER
+        
+        # Position value based on margin
+        base_size = margin_buying_power * risk_pct
+        
+        # Minimum viable trade size (to cover brokerage and make meaningful profit)
+        # With margin: 10K capital = 50K buying power, min trade = 10K
+        min_size = max(10000, self.current_capital)
+        
+        # Maximum single trade (50% of margin to leave room for SL)
+        max_size = margin_buying_power * 0.50
+        
+        position = max(min_size, min(base_size, max_size))
+        
+        logger.debug(f"Position size: ₹{position:,.0f} "
+                    f"({risk_pct*100:.0f}% of ₹{margin_buying_power:,.0f} margin)")
+        
+        return position
+    
+    def get_buying_power(self) -> float:
+        """Get total buying power including margin."""
+        return self.current_capital * INTRADAY_MARGIN_MULTIPLIER
+    
+    def get_dynamic_risk_pct(self) -> float:
+        """
+        Adjust risk percentage based on performance.
+        - Winning streak: Can increase slightly
+        - Drawdown: Reduce risk to preserve capital
+        """
+        if self.drawdown > 0.10:  # 10%+ drawdown
+            return 0.05  # Reduce to 5% per trade
+        elif self.drawdown > 0.05:  # 5-10% drawdown
+            return 0.08  # Reduce to 8%
+        elif self.realized_pnl > self.initial_capital * 0.10:  # 10%+ profit
+            return 0.12  # Can increase to 12%
+        else:
+            return 0.10  # Default 10%
+    
+    def should_reduce_exposure(self) -> bool:
+        """Check if we should reduce position sizes due to drawdown."""
+        return self.drawdown > 0.07  # 7% drawdown threshold
+    
+    def get_stats(self) -> dict:
+        """Get capital statistics."""
+        return {
+            "initial": self.initial_capital,
+            "current": self.current_capital,
+            "realized_pnl": self.realized_pnl,
+            "return_pct": (self.realized_pnl / self.initial_capital) * 100 if self.initial_capital > 0 else 0,
+            "peak": self.peak_capital,
+            "drawdown_pct": self.drawdown * 100,
+        }
+
+# Global capital manager instance
+CAPITAL_MANAGER = None
+
+def get_capital_manager(initial_capital: float = None) -> DynamicCapitalManager:
+    """Get or create the global capital manager."""
+    global CAPITAL_MANAGER
+    if CAPITAL_MANAGER is None and initial_capital is not None:
+        CAPITAL_MANAGER = DynamicCapitalManager(initial_capital)
+        logger.info(f"💰 Capital Manager initialized with ₹{initial_capital:,.0f}")
+    return CAPITAL_MANAGER
 
 # ══════════════════════════════════════════════════════════════════════
 # KEY FIX: Trade WITH the market, not against it
@@ -1563,7 +1683,19 @@ class AdaptiveV3Trader:
         self.symbol = symbol
         self.direction = direction  # Now overridden by real-time bias in _scan_for_entry
         self.ml_score = ml_score  # Used for stock SELECTION only, not direction
-        self.capital = config["capital"]["total"]
+        
+        # ══════════════════════════════════════════════════════════════
+        # DYNAMIC CAPITAL: Use current capital (includes profits!)
+        # Not the static config value that never changes
+        # ══════════════════════════════════════════════════════════════
+        initial_capital = config["capital"]["total"]
+        cap_mgr = get_capital_manager(initial_capital)
+        if cap_mgr:
+            self.capital = cap_mgr.current_capital  # Use CURRENT capital with profits!
+            logger.debug(f"Using dynamic capital: ₹{self.capital:,.0f} (initial: ₹{initial_capital:,.0f})")
+        else:
+            self.capital = initial_capital
+        
         self.config = config
         self.cost_model = AngelOneCostModel()
         
@@ -1739,6 +1871,19 @@ class AdaptiveV3Trader:
             "holding_minutes": holding_minutes,
         }
         self.trades.append(trade_record)
+        
+        # ══════════════════════════════════════════════════════════════
+        # UPDATE DYNAMIC CAPITAL - Position sizes grow with profits!
+        # ══════════════════════════════════════════════════════════════
+        cap_mgr = get_capital_manager()
+        if cap_mgr:
+            cap_mgr.update_pnl(net)
+            # Update self.capital for next trade's position sizing
+            self.capital = cap_mgr.current_capital
+            stats = cap_mgr.get_stats()
+            logger.info(f"📊 Capital: ₹{stats['current']:,.0f} | "
+                       f"Total P&L: ₹{stats['realized_pnl']:+,.0f} ({stats['return_pct']:+.1f}%) | "
+                       f"DD: {stats['drawdown_pct']:.1f}%")
         
         # Log to paper trading tracker (only in paper mode)
         if self.config.get("trading", {}).get("mode") == "paper":
@@ -1978,14 +2123,50 @@ class AdaptiveV3Trader:
             risk_pct *= 1.1
         
         # ══════════════════════════════════════════════════════════════
-        # POSITION SIZE CAP - Max 3% per trade (enforced by bounds)
-        # This prevents single trade from wiping out days of gains
+        # DYNAMIC POSITION SIZING WITH INTRADAY MARGIN (5x LEVERAGE)
+        # 
+        # Key insight for small capital profitability:
+        # - Capital: Rs 10,000
+        # - Intraday Margin: 5x = Rs 50,000 buying power
+        # - Position: 30% of margin = Rs 15,000 worth of shares
+        # - Stock at Rs 1,500: 15,000 / 1,500 = 10 shares (not 1!)
+        # 
+        # This is how real intraday trading works!
         # ══════════════════════════════════════════════════════════════
-        risk_pct = min(risk_pct, self.max_position_pct)  # Use bounded value, not hardcoded
-        risk_pct = max(risk_pct, MIN_POSITION_PCT)       # At least 1% to avoid tiny positions
-
-        # Calculate shares based on risk
-        self.shares = max(1, int(self.capital * risk_pct / max(risk, min_risk)))
+        cap_mgr = get_capital_manager()
+        if cap_mgr:
+            current_capital = cap_mgr.current_capital
+            dynamic_risk_pct = cap_mgr.get_dynamic_risk_pct()
+            risk_pct = min(risk_pct, dynamic_risk_pct, self.max_position_pct)
+            
+            if cap_mgr.should_reduce_exposure():
+                risk_pct *= 0.7
+                logger.warning(f"⚠️ Drawdown mode: reducing position to {risk_pct*100:.1f}%")
+        else:
+            current_capital = self.capital
+            risk_pct = min(risk_pct, self.max_position_pct)
+        
+        risk_pct = max(risk_pct, MIN_POSITION_PCT)
+        
+        # ══════════════════════════════════════════════════════════════
+        # APPLY INTRADAY MARGIN LEVERAGE (5x)
+        # This is the KEY fix for small capital!
+        # ══════════════════════════════════════════════════════════════
+        margin_buying_power = current_capital * INTRADAY_MARGIN_MULTIPLIER
+        position_value = margin_buying_power * risk_pct  # Value of shares to buy
+        
+        # Calculate shares based on MARGIN buying power (not just capital!)
+        self.shares = max(1, int(position_value / self.entry_price))
+        
+        # Safety check: Limit to what margin can actually cover
+        # Margin required per share is typically 20% of price for MIS
+        margin_per_share = self.entry_price * 0.20  # 20% margin requirement
+        max_shares_by_margin = int(current_capital / margin_per_share)
+        self.shares = min(self.shares, max(1, max_shares_by_margin))
+        
+        logger.info(f"📊 Position Sizing: Capital ₹{current_capital:,.0f} × {INTRADAY_MARGIN_MULTIPLIER}x margin "
+                   f"= ₹{margin_buying_power:,.0f} buying power")
+        logger.info(f"   → {risk_pct*100:.0f}% = ₹{position_value:,.0f} → {self.shares} shares @ ₹{self.entry_price:,.2f}")
         
         # Use broker's margin calculator if available
         # Margin usage is also adjusted by Claude Brain's position_size_factor
@@ -2866,6 +3047,7 @@ class AdaptiveV3Trader:
 def run(symbols=None, backtest_date=None):
     global MARKET_TREND, ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS
     global CIRCUIT_BREAKER_TRIGGERED, DAILY_PNL, DAILY_STARTING_CAPITAL
+    global MIN_ML_CONFIDENCE, BLOCKED_REGIMES
     
     config = load_config()
     target_date = date.fromisoformat(backtest_date) if backtest_date else None
@@ -3033,7 +3215,7 @@ def run(symbols=None, backtest_date=None):
             # Apply entry filters (direction control)
             filters = brain_advice.get("entry_filters", {})
             if filters:
-                global ENABLE_LONGS, ENABLE_SHORTS, MAX_LONGS, MAX_SHORTS, MIN_ML_CONFIDENCE, BLOCKED_REGIMES
+                # Note: global declarations are at function top
                 if "enable_longs" in filters:
                     ENABLE_LONGS = filters["enable_longs"]
                 if "enable_shorts" in filters:
