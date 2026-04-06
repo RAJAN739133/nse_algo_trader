@@ -20,9 +20,11 @@
 name: NSE Algo Trader
 
 on:
-  # Scheduled run - Weekdays at 8:50 AM IST (3:20 AM UTC)
+  # Scheduled run - Weekdays at 8:20 AM IST (2:50 AM UTC)
+  # Note: GitHub Actions can delay scheduled runs by 30-60 min during peak hours
+  # Setting 8:20 AM to ensure it starts before 9:15 AM market open
   schedule:
-    - cron: '20 3 * * 1-5'  # Mon-Fri at 3:20 UTC = 8:50 AM IST
+    - cron: '50 2 * * 1-5'  # Mon-Fri at 2:50 UTC = 8:20 AM IST
   
   # Manual trigger
   workflow_dispatch:
